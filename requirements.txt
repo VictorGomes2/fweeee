@@ -5,10 +5,9 @@ flask-cors
 Flask-Migrate
 Flask-SQLAlchemy
 Werkzeug
-psycopg2-binary
+psycopg[binary]
 gunicorn
 SQLAlchemy
-psycopg2-binary
 openpyxl
 xlsxwriter
 cloudinary
