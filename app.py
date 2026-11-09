@@ -9,6 +9,9 @@
 
 import os
 import datetime
+import threading
+import time
+import urllib.request
 from functools import wraps
 import jwt  # PyJWT
 import io  # Necessário para a função de exportar
@@ -18,7 +21,7 @@ from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
 from flask_migrate import Migrate
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import func  # Importação para uso em estatísticas e cálculos
+from sqlalchemy import func, text as sql_text  # Importação para uso em estatísticas e cálculos
 from sqlalchemy.orm import joinedload
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -39,10 +42,13 @@ DATABASE_URI = os.environ.get('DATABASE_URL')
 if DATABASE_URI and DATABASE_URI.startswith("postgres://"):
     DATABASE_URI = DATABASE_URI.replace("postgres://", "postgresql://", 1)
 
-# Se não encontrar a variável de ambiente, usa a string de conexão diretamente
+# A conexão deve vir do ambiente (Render -> Neon).
+# Não mantenha credenciais do banco gravadas no código.
 if not DATABASE_URI:
-    DATABASE_URI = 'postgresql://reurb_user:D0O9OAg8B0921t0C9RHhk42Ft9noVGXr@dpg-d39l3q0dl3ps73aavla0-a.oregon-postgres.render.com/reurb_apk_zr6m'
-    print("AVISO: Usando banco de dados de produção para desenvolvimento local.")
+    raise RuntimeError(
+        "DATABASE_URL não configurada. Configure a URL do PostgreSQL do Neon "
+        "nas Environment Variables do Render."
+    )
 
 
 UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
@@ -50,6 +56,14 @@ UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'upload
 app.config['SECRET_KEY'] = SECRET_KEY
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URI
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Opções importantes para PostgreSQL/Neon:
+# - pool_pre_ping: verifica conexões que ficaram inválidas.
+# - pool_recycle: recicla conexões antigas e reduz problemas de conexão ociosa.
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': int(os.environ.get('DB_POOL_RECYCLE', '300')),
+}
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
 
@@ -320,6 +334,108 @@ def to_int(value):
     try:
         return int(float(value))
     except (ValueError, TypeError): return None
+
+
+# =======================================================================
+# HEALTH CHECK / KEEP-ALIVE - RENDER + NEON
+# =======================================================================
+#
+# O endpoint /healthz faz uma consulta simples no PostgreSQL.
+# Assim, quando o Render/UptimeRobot acessar esta URL, o Neon também
+# recebe atividade e pode manter/reabrir a conexão.
+#
+# A rotina interna abaixo é opcional e funciona enquanto o processo do
+# Render estiver executando. Para evitar que um serviço gratuito do Render
+# permaneça dormindo, recomenda-se também um monitor externo (ex.: UptimeRobot)
+# acessando /healthz a cada 5 minutos.
+# =======================================================================
+
+KEEP_ALIVE_ENABLED = os.environ.get('KEEP_ALIVE_ENABLED', 'true').strip().lower() == 'true'
+KEEP_ALIVE_INTERVAL = max(30, int(os.environ.get('KEEP_ALIVE_INTERVAL', '120')))
+KEEP_ALIVE_URL = os.environ.get('KEEP_ALIVE_URL', '').strip()
+KEEP_ALIVE_TIMEOUT = max(1, int(os.environ.get('KEEP_ALIVE_TIMEOUT', '5')))
+
+KEEP_ALIVE_DB_ENABLED = os.environ.get('KEEP_ALIVE_DB_ENABLED', 'true').strip().lower() == 'true'
+KEEP_ALIVE_DB_INTERVAL = max(30, int(os.environ.get('KEEP_ALIVE_DB_INTERVAL', '120')))
+
+
+@app.route('/healthz', methods=['GET'])
+def healthz():
+    """Health check usado pelo Render/monitor externo e pelo keep-alive."""
+    try:
+        db_ok = False
+
+        if KEEP_ALIVE_DB_ENABLED:
+            # Consulta mínima que acorda/verifica o PostgreSQL do Neon.
+            db.session.execute(sql_text('SELECT 1'))
+            db.session.remove()
+            db_ok = True
+
+        return jsonify({
+            'status': 'ok',
+            'database': 'ok' if db_ok else 'disabled',
+            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
+        }), 200
+
+    except Exception as e:
+        db.session.remove()
+        app.logger.warning(f'Health check do banco falhou: {e}')
+        return jsonify({
+            'status': 'degraded',
+            'database': 'error',
+            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
+        }), 503
+
+
+def _keep_alive_loop():
+    """Mantém o serviço ativo enquanto o processo do backend estiver vivo."""
+    # Pequeno atraso para deixar o Gunicorn/Flask terminar a inicialização.
+    time.sleep(10)
+
+    while True:
+        try:
+            # 1) Mantém/verifica a conexão com o Neon diretamente.
+            if KEEP_ALIVE_DB_ENABLED:
+                with app.app_context():
+                    db.session.execute(sql_text('SELECT 1'))
+                    db.session.remove()
+
+            # 2) Faz uma requisição HTTP ao próprio backend, se configurado.
+            # Isso também gera atividade no Render.
+            if KEEP_ALIVE_URL:
+                req = urllib.request.Request(
+                    KEEP_ALIVE_URL,
+                    headers={'User-Agent': 'CM-REURB-KeepAlive/1.0'}
+                )
+                with urllib.request.urlopen(req, timeout=KEEP_ALIVE_TIMEOUT) as response:
+                    response.read(64)
+
+        except Exception as e:
+            app.logger.warning(f'Keep-alive falhou: {e}')
+
+        time.sleep(KEEP_ALIVE_INTERVAL)
+
+
+def start_keep_alive():
+    """Inicia a rotina em background uma única vez por processo."""
+    if not KEEP_ALIVE_ENABLED:
+        app.logger.info('Keep-alive desativado por KEEP_ALIVE_ENABLED.')
+        return
+
+    # Evita duplicação do thread no Flask development reloader.
+    if os.environ.get('WERKZEUG_RUN_MAIN') == 'false':
+        return
+
+    thread = threading.Thread(
+        target=_keep_alive_loop,
+        name='cm-reurb-keep-alive',
+        daemon=True
+    )
+    thread.start()
+    app.logger.info(
+        f'Keep-alive iniciado: intervalo={KEEP_ALIVE_INTERVAL}s, '
+        f'db={KEEP_ALIVE_DB_ENABLED}, url={KEEP_ALIVE_URL or "não configurada"}'
+    )
 
 
 # ------------------ CORS PRE-FLIGHT HANDLER ------------------
@@ -963,6 +1079,9 @@ def setup_database():
             return "Tabelas já criadas e usuário 'admin' já existe!"
     except Exception as e:
         return f"Erro ao configurar o banco de dados: {str(e)}"
+
+# Inicia a rotina quando o módulo é carregado pelo Gunicorn/Flask.
+start_keep_alive()
 
 # =======================================================================
 # INICIALIZAÇÃO
