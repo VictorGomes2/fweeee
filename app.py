@@ -636,6 +636,102 @@ def atualizar_area_lote_qgis(current_user, cadastro_id):
         return jsonify({'erro': 'Não foi possível salvar a área do lote.'}), 500
 
 
+# ------------------- INTEGRAÇÃO DE CONSTRUÇÕES COM O QGIS -------------------
+@app.route('/api/qgis/construcoes/<int:cadastro_id>', methods=['GET', 'POST', 'OPTIONS'])
+@token_required
+def gerenciar_construcoes_qgis(current_user, cadastro_id):
+    """Lista ou cria uma construção sem substituir as demais informações do cadastro."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    cadastro = CadastroReurb.query.get(cadastro_id)
+    if not cadastro:
+        return jsonify({'erro': 'Cadastro/proprietário não encontrado.'}), 404
+
+    if request.method == 'GET':
+        construcoes = Construcao.query.filter_by(cadastro_id=cadastro_id).order_by(Construcao.id.asc()).all()
+        resultado = []
+        for construcao in construcoes:
+            item = {col.name: getattr(construcao, col.name) for col in construcao.__table__.columns}
+            resultado.append(item)
+        return jsonify({'sucesso': True, 'cadastro_id': cadastro_id, 'construcoes': resultado}), 200
+
+    data = request.get_json(silent=True) or {}
+    nome = (data.get('nome') or '').strip()
+    padrao = (data.get('padrao_construtivo') or '').strip()
+    area = to_float(data.get('area_construida'))
+    if not nome:
+        return jsonify({'erro': 'Informe o nome/identificação da construção.'}), 400
+    if area is None or not math.isfinite(area) or area <= 0:
+        return jsonify({'erro': 'Área construída inválida. Informe uma área maior que zero.'}), 400
+    if not padrao:
+        return jsonify({'erro': 'Informe o padrão construtivo.'}), 400
+
+    try:
+        nova = Construcao(
+            cadastro_id=cadastro_id,
+            nome=nome,
+            area_construida=area,
+            uso_principal=data.get('uso_principal'),
+            padrao_construtivo=padrao,
+            tipo_imovel=data.get('tipo_imovel'),
+            estrutura=data.get('estrutura'),
+            cobertura=data.get('cobertura'),
+            instalacao_sanitaria=data.get('instalacao_sanitaria'),
+            forro=data.get('forro'),
+            piso=data.get('piso'),
+            portas=data.get('portas'),
+            janelas=data.get('janelas'),
+            revestimento=data.get('revestimento')
+        )
+        db.session.add(nova)
+        db.session.commit()
+        return jsonify({
+            'sucesso': True,
+            'mensagem': 'Construção cadastrada com sucesso.',
+            'construcao': {col.name: getattr(nova, col.name) for col in nova.__table__.columns}
+        }), 201
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f'Erro ao cadastrar construção via QGIS para cadastro {cadastro_id}: {str(e)}')
+        return jsonify({'erro': 'Não foi possível cadastrar a construção.'}), 500
+
+
+@app.route('/api/qgis/atualizar-area-construcao/<int:construcao_id>', methods=['PUT', 'OPTIONS'])
+@token_required
+def atualizar_area_construcao_qgis(current_user, construcao_id):
+    """Atualiza somente a área construída de uma construção vinculada no QGIS."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    data = request.get_json(silent=True) or {}
+    area = to_float(data.get('area_construida'))
+    if area is None or not math.isfinite(area) or area <= 0:
+        return jsonify({'erro': 'Área construída inválida. Informe um valor maior que zero, em m².'}), 400
+
+    construcao = Construcao.query.get(construcao_id)
+    if not construcao:
+        return jsonify({'erro': 'Construção não encontrada.'}), 404
+
+    try:
+        construcao.area_construida = area
+        cadastro = CadastroReurb.query.get(construcao.cadastro_id)
+        if cadastro:
+            cadastro.data_atualizacao = datetime.datetime.utcnow()
+        db.session.commit()
+        return jsonify({
+            'sucesso': True,
+            'mensagem': 'Área da construção atualizada a partir do QGIS.',
+            'construcao_id': construcao.id,
+            'cadastro_id': construcao.cadastro_id,
+            'area_construida': construcao.area_construida
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f'Erro ao atualizar área da construção {construcao_id} via QGIS: {str(e)}')
+        return jsonify({'erro': 'Não foi possível atualizar a área da construção.'}), 500
+
+
 @app.route('/api/cadastros', methods=['GET'])
 @token_required
 def get_cadastros(current_user):
