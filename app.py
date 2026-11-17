@@ -22,7 +22,7 @@ from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
 from flask_migrate import Migrate
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import func, text as sql_text  # Importação para uso em estatísticas e cálculos
+from sqlalchemy import func, text as sql_text, inspect as sqlalchemy_inspect  # Importação para uso em estatísticas e cálculos
 from sqlalchemy.orm import joinedload
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -150,6 +150,8 @@ class CadastroReurb(db.Model):
     imovel_medida_ld = db.Column(db.Float, nullable=True)
     imovel_medida_le = db.Column(db.Float, nullable=True)
     imovel_area_total = db.Column(db.Float)
+    # Geometria do lote vinculada pelo QGIS, armazenada como GeoJSON EPSG:4326.
+    lote_geometria = db.Column(db.Text, nullable=True)
     imovel_data_ocupacao = db.Column(db.String(20), nullable=True)
     imovel_infra_agua = db.Column(db.String(10))
     imovel_infra_esgoto = db.Column(db.String(10))
@@ -205,6 +207,8 @@ class Construcao(db.Model):
     portas = db.Column(db.String(50), nullable=True)
     janelas = db.Column(db.String(50), nullable=True)
     revestimento = db.Column(db.String(50), nullable=True)
+    # Geometria da construção vinculada pelo QGIS, armazenada como GeoJSON EPSG:4326.
+    geometria = db.Column(db.Text, nullable=True)
 
 
 class GuiaIPTU(db.Model):
@@ -548,6 +552,7 @@ def cadastrar_reurb(current_user):
             imovel_medida_ld=to_float(data.get('imovel_medida_ld')),
             imovel_medida_le=to_float(data.get('imovel_medida_le')),
             imovel_area_total=to_float(data.get('imovel_area_total')),
+            lote_geometria=data.get('lote_geometria'),
             imovel_data_ocupacao=data.get('imovel_data_ocupacao'),
             imovel_infra_agua=data.get('imovel_infra_agua'), imovel_infra_esgoto=data.get('imovel_infra_esgoto'),
             imovel_infra_iluminacao=data.get('imovel_infra_iluminacao'),
@@ -587,7 +592,8 @@ def cadastrar_reurb(current_user):
                 piso=const_data.get('piso'),
                 portas=const_data.get('portas'),
                 janelas=const_data.get('janelas'),
-                revestimento=const_data.get('revestimento')
+                revestimento=const_data.get('revestimento'),
+                geometria=const_data.get('geometria')
             )
             novo_cadastro.construcoes.append(nova_construcao)
 
@@ -610,6 +616,7 @@ def atualizar_area_lote_qgis(current_user, cadastro_id):
 
     data = request.get_json(silent=True) or {}
     area = to_float(data.get('imovel_area_total'))
+    geometria = data.get('lote_geometria')
 
     if area is None or not math.isfinite(area) or area <= 0:
         return jsonify({'erro': 'Área inválida. Informe uma área maior que zero, em m².'}), 400
@@ -619,8 +626,10 @@ def atualizar_area_lote_qgis(current_user, cadastro_id):
         return jsonify({'erro': 'Cadastro não encontrado.'}), 404
 
     try:
-        # Esta integração altera somente o campo de área do lote.
-        cadastro.imovel_area_total = area
+        # Integração QGIS: atualiza área e preserva a geometria real do lote.
+        cadastro.imovel_area_total = round(area, 2)
+        if geometria:
+            cadastro.lote_geometria = json.dumps(geometria, separators=(',', ':'), ensure_ascii=False) if isinstance(geometria, (dict, list)) else str(geometria)
         cadastro.data_atualizacao = datetime.datetime.utcnow()
         db.session.commit()
 
@@ -628,7 +637,8 @@ def atualizar_area_lote_qgis(current_user, cadastro_id):
             'sucesso': True,
             'mensagem': 'Área do lote atualizada a partir do QGIS.',
             'cadastro_id': cadastro.id,
-            'imovel_area_total': cadastro.imovel_area_total
+            'imovel_area_total': cadastro.imovel_area_total,
+            'lote_geometria': cadastro.lote_geometria
         }), 200
     except Exception as e:
         db.session.rollback()
@@ -660,6 +670,7 @@ def gerenciar_construcoes_qgis(current_user, cadastro_id):
     nome = (data.get('nome') or '').strip()
     padrao = (data.get('padrao_construtivo') or '').strip()
     area = to_float(data.get('area_construida'))
+    geometria = data.get('geometria')
     if not nome:
         return jsonify({'erro': 'Informe o nome/identificação da construção.'}), 400
     if area is None or not math.isfinite(area) or area <= 0:
@@ -682,7 +693,8 @@ def gerenciar_construcoes_qgis(current_user, cadastro_id):
             piso=data.get('piso'),
             portas=data.get('portas'),
             janelas=data.get('janelas'),
-            revestimento=data.get('revestimento')
+            revestimento=data.get('revestimento'),
+            geometria=json.dumps(geometria, separators=(',', ':'), ensure_ascii=False) if isinstance(geometria, (dict, list)) else geometria
         )
         db.session.add(nova)
         db.session.commit()
@@ -697,6 +709,62 @@ def gerenciar_construcoes_qgis(current_user, cadastro_id):
         return jsonify({'erro': 'Não foi possível cadastrar a construção.'}), 500
 
 
+@app.route('/api/qgis/construcoes/<int:cadastro_id>/<int:construcao_id>', methods=['PUT', 'DELETE', 'OPTIONS'])
+@token_required
+def editar_ou_excluir_construcao_qgis(current_user, cadastro_id, construcao_id):
+    """Edita/exclui uma construção pelo gerenciador QGIS sem afetar as demais."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    construcao = Construcao.query.filter_by(id=construcao_id, cadastro_id=cadastro_id).first()
+    if not construcao:
+        return jsonify({'erro': 'Construção não encontrada para este cadastro.'}), 404
+
+    if request.method == 'DELETE':
+        try:
+            db.session.delete(construcao)
+            cadastro = CadastroReurb.query.get(cadastro_id)
+            if cadastro:
+                cadastro.data_atualizacao = datetime.datetime.utcnow()
+            db.session.commit()
+            return jsonify({'sucesso': True, 'mensagem': 'Construção excluída com sucesso.'}), 200
+        except Exception as e:
+            db.session.rollback()
+            app.logger.error(f'Erro ao excluir construção {construcao_id} via QGIS: {str(e)}')
+            return jsonify({'erro': 'Não foi possível excluir a construção.'}), 500
+
+    data = request.get_json(silent=True) or {}
+    nome = (data.get('nome') or construcao.nome or '').strip()
+    area = to_float(data.get('area_construida'))
+    if not nome:
+        return jsonify({'erro': 'Informe o nome/identificação da construção.'}), 400
+    if area is None or not math.isfinite(area) or area <= 0:
+        return jsonify({'erro': 'Área construída inválida. Informe uma área maior que zero.'}), 400
+
+    try:
+        construcao.nome = nome
+        construcao.area_construida = round(area, 2)
+        for campo in ['uso_principal', 'padrao_construtivo', 'tipo_imovel', 'estrutura', 'cobertura', 'instalacao_sanitaria', 'forro', 'piso', 'portas', 'janelas', 'revestimento']:
+            if campo in data:
+                setattr(construcao, campo, data.get(campo))
+        if data.get('geometria'):
+            geometria = data.get('geometria')
+            construcao.geometria = json.dumps(geometria, separators=(',', ':'), ensure_ascii=False) if isinstance(geometria, (dict, list)) else str(geometria)
+        cadastro = CadastroReurb.query.get(cadastro_id)
+        if cadastro:
+            cadastro.data_atualizacao = datetime.datetime.utcnow()
+        db.session.commit()
+        return jsonify({
+            'sucesso': True,
+            'mensagem': 'Construção atualizada com sucesso.',
+            'construcao': {col.name: getattr(construcao, col.name) for col in construcao.__table__.columns}
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f'Erro ao atualizar construção {construcao_id} via QGIS: {str(e)}')
+        return jsonify({'erro': 'Não foi possível atualizar a construção.'}), 500
+
+
 @app.route('/api/qgis/atualizar-area-construcao/<int:construcao_id>', methods=['PUT', 'OPTIONS'])
 @token_required
 def atualizar_area_construcao_qgis(current_user, construcao_id):
@@ -706,6 +774,7 @@ def atualizar_area_construcao_qgis(current_user, construcao_id):
 
     data = request.get_json(silent=True) or {}
     area = to_float(data.get('area_construida'))
+    geometria = data.get('geometria')
     if area is None or not math.isfinite(area) or area <= 0:
         return jsonify({'erro': 'Área construída inválida. Informe um valor maior que zero, em m².'}), 400
 
@@ -714,7 +783,9 @@ def atualizar_area_construcao_qgis(current_user, construcao_id):
         return jsonify({'erro': 'Construção não encontrada.'}), 404
 
     try:
-        construcao.area_construida = area
+        construcao.area_construida = round(area, 2)
+        if geometria:
+            construcao.geometria = json.dumps(geometria, separators=(',', ':'), ensure_ascii=False) if isinstance(geometria, (dict, list)) else str(geometria)
         cadastro = CadastroReurb.query.get(construcao.cadastro_id)
         if cadastro:
             cadastro.data_atualizacao = datetime.datetime.utcnow()
@@ -724,7 +795,8 @@ def atualizar_area_construcao_qgis(current_user, construcao_id):
             'mensagem': 'Área da construção atualizada a partir do QGIS.',
             'construcao_id': construcao.id,
             'cadastro_id': construcao.cadastro_id,
-            'area_construida': construcao.area_construida
+            'area_construida': construcao.area_construida,
+            'geometria': construcao.geometria
         }), 200
     except Exception as e:
         db.session.rollback()
@@ -823,10 +895,17 @@ def gerenciar_cadastro_por_id(current_user, id):
                 else:
                     setattr(cadastro, key, value)
         
+        # O formulário de edição envia as construções novamente. Antes de recriá-las,
+        # preservamos as geometrias já gravadas quando o frontend não as reenviar.
+        geometrias_existentes = {str(c.id): c.geometria for c in Construcao.query.filter_by(cadastro_id=id).all() if c.geometria}
         Construcao.query.filter_by(cadastro_id=id).delete()
         
         construcoes_data = data.get('construcoes', [])
         for const_data in construcoes_data:
+            const_id = const_data.get('id')
+            geometria_const = const_data.get('geometria') or geometrias_existentes.get(str(const_id))
+            if isinstance(geometria_const, (dict, list)):
+                geometria_const = json.dumps(geometria_const, separators=(',', ':'), ensure_ascii=False)
             nova_construcao = Construcao(
                 cadastro_id=id,
                 nome=const_data.get('nome'),
@@ -841,7 +920,8 @@ def gerenciar_cadastro_por_id(current_user, id):
                 piso=const_data.get('piso'),
                 portas=const_data.get('portas'),
                 janelas=const_data.get('janelas'),
-                revestimento=const_data.get('revestimento')
+                revestimento=const_data.get('revestimento'),
+                geometria=geometria_const
             )
             db.session.add(nova_construcao)
 
@@ -1197,6 +1277,28 @@ def serve_upload(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 # =======================================================================
+# COMPATIBILIDADE DE BANCO: GEOMETRIAS DO QGIS
+# =======================================================================
+def garantir_colunas_geometria():
+    """Garante as colunas novas sem exigir PostGIS ou migração manual."""
+    try:
+        insp = sqlalchemy_inspect(db.engine)
+        tabelas = {t['name'] for t in insp.get_table_names()}
+        if 'cadastros_reurb' in tabelas:
+            colunas = {c['name'] for c in insp.get_columns('cadastros_reurb')}
+            if 'lote_geometria' not in colunas:
+                db.session.execute(sql_text('ALTER TABLE cadastros_reurb ADD COLUMN lote_geometria TEXT'))
+        if 'construcoes' in tabelas:
+            colunas = {c['name'] for c in insp.get_columns('construcoes')}
+            if 'geometria' not in colunas:
+                db.session.execute(sql_text('ALTER TABLE construcoes ADD COLUMN geometria TEXT'))
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        app.logger.warning(f'Não foi possível verificar/adicionar as colunas de geometria: {e}')
+
+
+# =======================================================================
 # ROTA PARA SETUP INICIAL (USAR COM CUIDADO)
 # =======================================================================
 @app.route('/setup')
@@ -1204,6 +1306,7 @@ def setup_database():
     try:
         with app.app_context():
             db.create_all()
+            garantir_colunas_geometria()
             if not Usuario.query.filter_by(usuario="admin").first():
                 admin_user = Usuario(nome="Administrador", usuario="admin", senha="admin", acesso="Administrador")
                 db.session.add(admin_user)
@@ -1212,6 +1315,14 @@ def setup_database():
             return "Tabelas já criadas e usuário 'admin' já existe!"
     except Exception as e:
         return f"Erro ao configurar o banco de dados: {str(e)}"
+
+# Garante as colunas novas também em deploys que não utilizam /setup.
+try:
+    with app.app_context():
+        db.create_all()
+        garantir_colunas_geometria()
+except Exception as e:
+    app.logger.warning(f'Inicialização das tabelas/colunas de geometria adiada: {e}')
 
 # Inicia a rotina quando o módulo é carregado pelo Gunicorn/Flask.
 start_keep_alive()
