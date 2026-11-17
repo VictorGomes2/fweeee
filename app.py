@@ -11,6 +11,7 @@ import os
 import datetime
 import threading
 import time
+import math
 import urllib.request
 from functools import wraps
 import jwt  # PyJWT
@@ -597,6 +598,42 @@ def cadastrar_reurb(current_user):
         db.session.rollback()
         app.logger.error(f"Erro ao criar cadastro: {str(e)}")
         return jsonify({'mensagem': f'Erro ao criar cadastro: {str(e)}'}), 400
+
+
+# ------------------- ATUALIZAÇÃO DE ÁREA VINDO DO QGIS -------------------
+@app.route('/api/qgis/atualizar-area-lote/<int:cadastro_id>', methods=['PUT', 'OPTIONS'])
+@token_required
+def atualizar_area_lote_qgis(current_user, cadastro_id):
+    """Atualiza exclusivamente a área do lote a partir da geometria vinculada no QGIS."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    data = request.get_json(silent=True) or {}
+    area = to_float(data.get('imovel_area_total'))
+
+    if area is None or not math.isfinite(area) or area <= 0:
+        return jsonify({'erro': 'Área inválida. Informe uma área maior que zero, em m².'}), 400
+
+    cadastro = CadastroReurb.query.get(cadastro_id)
+    if not cadastro:
+        return jsonify({'erro': 'Cadastro não encontrado.'}), 404
+
+    try:
+        # Esta integração altera somente o campo de área do lote.
+        cadastro.imovel_area_total = area
+        cadastro.data_atualizacao = datetime.datetime.utcnow()
+        db.session.commit()
+
+        return jsonify({
+            'sucesso': True,
+            'mensagem': 'Área do lote atualizada a partir do QGIS.',
+            'cadastro_id': cadastro.id,
+            'imovel_area_total': cadastro.imovel_area_total
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f'Erro ao atualizar área do lote {cadastro_id} via QGIS: {str(e)}')
+        return jsonify({'erro': 'Não foi possível salvar a área do lote.'}), 500
 
 
 @app.route('/api/cadastros', methods=['GET'])
