@@ -646,23 +646,44 @@ def atualizar_area_lote_qgis(current_user, cadastro_id):
         return jsonify({'erro': 'Cadastro não encontrado.'}), 404
 
     try:
-        # Esta integração altera somente o campo de área do lote.
-        cadastro.imovel_area_total = area
+        # Recebe e valida as coordenadas calculadas pelo plugin QGIS.
+        # Se ambas forem enviadas, persiste o centroide no cadastro.
+        latitude = to_float(data.get('latitude'))
+        longitude = to_float(data.get('longitude'))
+
+        if latitude is not None or longitude is not None:
+            if (latitude is None or longitude is None or
+                    not math.isfinite(latitude) or not math.isfinite(longitude) or
+                    latitude < -90 or latitude > 90 or
+                    longitude < -180 or longitude > 180):
+                return jsonify({'erro': 'Coordenadas do centroide inválidas.'}), 400
+
         geometria = data.get('geometria_lote')
+        geometria_json = None
         if geometria is not None:
             if isinstance(geometria, str):
                 geometria = json.loads(geometria)
             if not isinstance(geometria, dict) or geometria.get('type') not in ('Polygon', 'MultiPolygon'):
                 return jsonify({'erro': 'Geometria do lote inválida. Envie GeoJSON Polygon ou MultiPolygon.'}), 400
-            cadastro.geometria_lote = json.dumps(geometria, ensure_ascii=False, separators=(',', ':'))
+            geometria_json = json.dumps(geometria, ensure_ascii=False, separators=(',', ':'))
+
+        # Só altera os campos espaciais recebidos; preserva os demais dados cadastrais.
+        cadastro.imovel_area_total = area
+        if latitude is not None and longitude is not None:
+            cadastro.latitude = latitude
+            cadastro.longitude = longitude
+        if geometria_json is not None:
+            cadastro.geometria_lote = geometria_json
         cadastro.data_atualizacao = datetime.datetime.utcnow()
         db.session.commit()
 
         return jsonify({
             'sucesso': True,
-            'mensagem': 'Área do lote atualizada a partir do QGIS.',
+            'mensagem': 'Área, geometria e centroide do lote atualizados a partir do QGIS.',
             'cadastro_id': cadastro.id,
-            'imovel_area_total': cadastro.imovel_area_total
+            'imovel_area_total': cadastro.imovel_area_total,
+            'latitude': cadastro.latitude,
+            'longitude': cadastro.longitude
         }), 200
     except Exception as e:
         db.session.rollback()
