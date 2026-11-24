@@ -17,6 +17,8 @@ import urllib.request
 from functools import wraps
 import jwt  # PyJWT
 import io  # Necessário para a função de exportar
+import csv
+import base64
 
 import pandas as pd
 from flask import Flask, request, jsonify, send_from_directory, send_file
@@ -1138,88 +1140,318 @@ def gerar_iptu(current_user, inscricao_imobiliaria):
     valores = CalculoTributarioService.calcular_valores(cadastro)
     return jsonify(valores)
 
-@app.route('/api/importar', methods=['POST'])
+
+def _serializar_valor_backup(valor):
+    if isinstance(valor, (datetime.datetime, datetime.date)):
+        return valor.isoformat()
+    return valor
+
+
+def _colunas_modelo(modelo):
+    return [col.name for col in modelo.__table__.columns]
+
+
+def _json_backup(valor):
+    return json.dumps(valor, ensure_ascii=False, separators=(',', ':'), default=_serializar_valor_backup)
+
+
+def _dados_auxiliares_backup():
+    return {
+        'padroes_construtivos': [
+            {'id': x.id, 'descricao': x.descricao, 'valor_m2': x.valor_m2}
+            for x in PadraoConstrutivo.query.order_by(PadraoConstrutivo.id).all()
+        ],
+        'valores_logradouro': [
+            {'id': x.id, 'logradouro': x.logradouro, 'valor_m2': x.valor_m2}
+            for x in ValorLogradouro.query.order_by(ValorLogradouro.id).all()
+        ],
+        'aliquotas_iptu': [
+            {'id': x.id, 'tipo': x.tipo, 'aliquota': x.aliquota}
+            for x in AliquotaIPTU.query.order_by(AliquotaIPTU.id).all()
+        ]
+    }
+
+
+@app.route('/api/exportar/campos', methods=['GET'])
 @token_required
-@admin_required
-def importar_dados(current_user):
-    if 'arquivo' not in request.files: return jsonify({'erro': 'Nenhum arquivo enviado'}), 400
-    file = request.files['arquivo']
-    if file.filename == '': return jsonify({'erro': 'Nome de arquivo vazio'}), 400
-    if file:
-        try:
-            df = pd.read_csv(file) if file.filename.endswith('.csv') else pd.read_excel(file)
-            column_mapping = {
-                'Nome do Requerente': 'req_nome', 'CPF do Requerente': 'req_cpf',
-                'Inscrição Imobiliária': 'inscricao_imobiliaria', 'Área Total do Lote (m²)': 'imovel_area_total',
-                'Renda Familiar (R$)': 'reurb_renda_familiar'}
-            df.rename(columns=column_mapping, inplace=True)
-            float_cols = ['imovel_area_total', 'reurb_renda_familiar', 'latitude', 'longitude']
-            for col in float_cols:
-                if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
-            df = df.where(pd.notnull(df), None)
-            for _, row in df.iterrows():
-                valid_data = {k: v for k, v in row.to_dict().items() if k in CadastroReurb.__table__.columns.keys()}
-                db.session.add(CadastroReurb(**valid_data))
-            db.session.commit()
-            return jsonify({'mensagem': 'Dados importados com sucesso!'}), 200
-        except Exception as e:
-            db.session.rollback()
-            return jsonify({'erro': f'Erro ao importar dados: {e}'}), 500
-    return jsonify({'erro': 'Tipo de arquivo não suportado'}), 400
+def listar_campos_exportacao(current_user):
+    """Entrega à interface TODOS os campos reais do cadastro e campos relacionados."""
+    campos = []
+    for coluna in CadastroReurb.__table__.columns:
+        campos.append({'id': coluna.name, 'nome': coluna.name.replace('_', ' ').capitalize(), 'grupo': 'Cadastro'})
+    for chave, rotulo in [
+        ('construcoes_json', 'Construções (atributos + geometrias)'),
+        ('guias_iptu_json', 'Guias IPTU (histórico e situação)'),
+        ('documentos_json', 'Documentos anexados (metadados e arquivos)'),
+        ('vvt', 'VVT - Valor Venal do Terreno'),
+        ('vvc', 'VVC - Valor Venal das Construções'),
+        ('vvi', 'VVI - Valor Venal do Imóvel'),
+        ('iptu', 'IPTU calculado'),
+        ('tipo_reurb', 'Classificação REURB'),
+        ('imovel_area_construida', 'Área construída total'),
+    ]:
+        campos.append({'id': chave, 'nome': rotulo, 'grupo': 'Dados complementares'})
+    return jsonify(campos)
+
 
 @app.route('/api/exportar', methods=['POST'])
 @token_required
 def exportar_dados(current_user):
+    """
+    Exporta CSV UTF-8 com separador ;. Cada cadastro ocupa uma linha.
+    Os relacionamentos e GeoJSON são preservados em colunas JSON, permitindo
+    restauração integral sem perder a estrutura relacional.
+    """
     try:
-        data = request.get_json()
-        colunas_selecionadas = data.get('colunas')
-        if not colunas_selecionadas:
-            return jsonify({'erro': 'Nenhuma coluna selecionada.'}), 400
+        data = request.get_json(silent=True) or {}
+        colunas_solicitadas = data.get('colunas') or []
+        exportacao_completa = bool(data.get('backup_completo'))
 
-        cadastros_db = CadastroReurb.query.options(joinedload(CadastroReurb.construcoes)).all()
-        if not cadastros_db:
-            return jsonify({'erro': 'Não há dados para exportar.'}), 404
+        colunas_cadastro = _colunas_modelo(CadastroReurb)
+        colunas_especiais = [
+            'construcoes_json', 'guias_iptu_json', 'documentos_json',
+            'vvt', 'vvc', 'vvi', 'iptu', 'tipo_reurb',
+            'imovel_area_construida', '__backup_metadata'
+        ]
+        permitidas = set(colunas_cadastro + colunas_especiais)
+        if exportacao_completa:
+            colunas = colunas_cadastro + colunas_especiais
+        else:
+            colunas = [c for c in colunas_solicitadas if c in permitidas and c != '__backup_metadata']
+            if not colunas:
+                return jsonify({'erro': 'Selecione pelo menos um campo para exportar.'}), 400
 
-        dados_para_exportar = []
-        for c in cadastros_db:
-            cadastro_data = {col.name: getattr(c, col.name) for col in c.__table__.columns}
+        cadastros = CadastroReurb.query.order_by(CadastroReurb.id).all()
+        metadata = _dados_auxiliares_backup()
+        metadata_json = _json_backup({
+            'formato': 'CM_REURB_FULL_V1',
+            'exportado_em': datetime.datetime.utcnow().isoformat() + 'Z',
+            **metadata
+        })
 
-            valores = CalculoTributarioService.calcular_valores(c)
-            renda = c.reurb_renda_familiar or 0
-            outro_imovel = c.reurb_outro_imovel or ''
-            tipo_reurb = 'REURB-S' if renda <= 7500 and outro_imovel.lower() == 'nao' else 'REURB-E'
+        output = io.StringIO(newline='')
+        writer = csv.DictWriter(output, fieldnames=colunas, delimiter=';', quotechar='"',
+                                quoting=csv.QUOTE_MINIMAL, lineterminator='\r\n')
+        writer.writeheader()
 
-            cadastro_data['tipo_reurb'] = tipo_reurb
-            cadastro_data.update(valores)
+        # Mesmo sem cadastros, o arquivo completo leva as tabelas auxiliares.
+        if not cadastros and exportacao_completa:
+            writer.writerow({'__backup_metadata': metadata_json})
 
-            total_area_construida = sum(construcao.area_construida or 0 for construcao in c.construcoes)
-            cadastro_data['imovel_area_construida'] = total_area_construida
-            
-            for key, value in cadastro_data.items():
-                if isinstance(value, (datetime.datetime, datetime.date)):
-                    cadastro_data[key] = value.strftime('%d/%m/%Y')
-            
-            dados_para_exportar.append(cadastro_data)
-        
-        df = pd.DataFrame(dados_para_exportar)
-        colunas_validas = [col for col in colunas_selecionadas if col in df.columns]
-        
-        df = df[colunas_validas]
+        for cadastro in cadastros:
+            linha = {col.name: _serializar_valor_backup(getattr(cadastro, col.name))
+                     for col in CadastroReurb.__table__.columns}
 
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False, sheet_name='Cadastros')
-        output.seek(0)
-        
-        return send_file(
-            output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheet.sheet',
-            as_attachment=True,
-            download_name='cadastros_reurb.xlsx'
-        )
+            construcoes = []
+            for item in sorted(cadastro.construcoes, key=lambda x: x.id):
+                construcoes.append({col.name: _serializar_valor_backup(getattr(item, col.name))
+                                    for col in Construcao.__table__.columns})
+
+            guias = []
+            for item in sorted(cadastro.guias_iptu, key=lambda x: x.id):
+                guias.append({col.name: _serializar_valor_backup(getattr(item, col.name))
+                              for col in GuiaIPTU.__table__.columns})
+
+            documentos = []
+            for item in sorted(cadastro.documentos, key=lambda x: x.id):
+                doc = {col.name: _serializar_valor_backup(getattr(item, col.name))
+                       for col in Documento.__table__.columns}
+                caminho = item.path_arquivo
+                if caminho and os.path.isfile(caminho):
+                    try:
+                        with open(caminho, 'rb') as arquivo:
+                            doc['arquivo_base64'] = base64.b64encode(arquivo.read()).decode('ascii')
+                    except OSError as erro:
+                        app.logger.warning(f'Não foi possível incluir arquivo {caminho} no backup: {erro}')
+                documentos.append(doc)
+
+            valores = CalculoTributarioService.calcular_valores(cadastro)
+            renda = cadastro.reurb_renda_familiar or 0
+            outro_imovel = (cadastro.reurb_outro_imovel or '').strip().lower()
+            linha.update({
+                'construcoes_json': _json_backup(construcoes),
+                'guias_iptu_json': _json_backup(guias),
+                'documentos_json': _json_backup(documentos),
+                'vvt': valores.get('vvt', 0),
+                'vvc': valores.get('vvc', 0),
+                'vvi': valores.get('vvi', 0),
+                'iptu': valores.get('iptu', 0),
+                'tipo_reurb': 'REURB-S' if renda <= 7500 and outro_imovel in ('nao', 'não') else 'REURB-E',
+                'imovel_area_construida': sum(x.area_construida or 0 for x in cadastro.construcoes),
+                '__backup_metadata': metadata_json if exportacao_completa else ''
+            })
+            writer.writerow({campo: linha.get(campo, '') for campo in colunas})
+
+        conteudo = '\ufeff' + output.getvalue()
+        arquivo_saida = io.BytesIO(conteudo.encode('utf-8'))
+        arquivo_saida.seek(0)
+        nome = 'backup_completo_cm_reurb.csv' if exportacao_completa else 'exportacao_cadastros_reurb.csv'
+        return send_file(arquivo_saida, mimetype='text/csv; charset=utf-8',
+                         as_attachment=True, download_name=nome)
     except Exception as e:
-        app.logger.error(f"Erro ao exportar dados: {str(e)}")
-        return jsonify({'erro': f'Erro inesperado: {e}'}), 500
+        db.session.rollback()
+        app.logger.exception('Erro ao exportar dados REURB')
+        return jsonify({'erro': f'Erro ao exportar dados: {str(e)}'}), 500
+
+
+def _converter_valor_coluna_backup(coluna, valor):
+    if valor is None or valor == '':
+        return None
+    tipo = coluna.type
+    try:
+        if isinstance(tipo, db.Integer):
+            return int(float(valor))
+        if isinstance(tipo, db.Float):
+            return float(str(valor).replace(',', '.'))
+        if isinstance(tipo, db.DateTime):
+            return datetime.datetime.fromisoformat(str(valor).replace('Z', '+00:00')).replace(tzinfo=None)
+        if isinstance(tipo, db.Date):
+            return datetime.date.fromisoformat(str(valor)[:10])
+    except (ValueError, TypeError):
+        raise ValueError(f'Valor inválido para o campo {coluna.name}: {valor}')
+    return valor
+
+
+@app.route('/api/importar', methods=['POST'])
+@token_required
+@admin_required
+def importar_dados(current_user):
+    if 'arquivo' not in request.files:
+        return jsonify({'erro': 'Nenhum arquivo enviado.'}), 400
+    arquivo = request.files['arquivo']
+    if not arquivo.filename:
+        return jsonify({'erro': 'Nome de arquivo vazio.'}), 400
+
+    try:
+        nome = arquivo.filename.lower()
+        if nome.endswith('.csv'):
+            texto = arquivo.stream.read().decode('utf-8-sig')
+            amostra = texto[:8192]
+            try:
+                dialeto = csv.Sniffer().sniff(amostra, delimiters=';,\t')
+                leitor = csv.DictReader(io.StringIO(texto), dialect=dialeto)
+            except csv.Error:
+                leitor = csv.DictReader(io.StringIO(texto), delimiter=';')
+            linhas = list(leitor)
+        else:
+            df = pd.read_excel(arquivo, dtype=object)
+            linhas = df.where(pd.notnull(df), None).to_dict(orient='records')
+
+        if not linhas:
+            return jsonify({'erro': 'O arquivo não contém registros.'}), 400
+
+        primeira = linhas[0]
+        metadados = None
+        if primeira.get('__backup_metadata'):
+            metadados = json.loads(primeira['__backup_metadata'])
+
+        if metadados and metadados.get('formato') == 'CM_REURB_FULL_V1':
+            # Restauração completa é destinada a banco vazio: evita duplicar ou sobrescrever
+            # silenciosamente dados já existentes.
+            tabelas_com_dados = [
+                CadastroReurb.query.first(), Construcao.query.first(), GuiaIPTU.query.first(),
+                Documento.query.first(), PadraoConstrutivo.query.first(),
+                ValorLogradouro.query.first(), AliquotaIPTU.query.first()
+            ]
+            if any(tabelas_com_dados):
+                return jsonify({'erro': 'A restauração integral exige um banco REURB vazio (cadastros, IPTU e PGV). Nenhum dado foi alterado.'}), 409
+
+            colunas_por_nome = {c.name: c for c in CadastroReurb.__table__.columns}
+            ids_cadastros = set()
+            for numero_linha, linha in enumerate(linhas, start=2):
+                if not any(linha.get(campo) not in (None, '') for campo in colunas_por_nome):
+                    continue
+                dados_cadastro = {
+                    nome_campo: _converter_valor_coluna_backup(coluna, linha.get(nome_campo))
+                    for nome_campo, coluna in colunas_por_nome.items()
+                    if nome_campo in linha and linha.get(nome_campo) not in (None, '')
+                }
+                cadastro_id = dados_cadastro.get('id')
+                if cadastro_id is None:
+                    raise ValueError(f'Linha {numero_linha}: backup integral sem ID do cadastro.')
+                if cadastro_id in ids_cadastros:
+                    raise ValueError(f'Linha {numero_linha}: ID de cadastro duplicado ({cadastro_id}).')
+                ids_cadastros.add(cadastro_id)
+                cadastro = CadastroReurb(**dados_cadastro)
+                db.session.add(cadastro)
+                db.session.flush()
+
+                for campo_json, modelo in [('construcoes_json', Construcao), ('guias_iptu_json', GuiaIPTU)]:
+                    bruto = linha.get(campo_json)
+                    itens = json.loads(bruto) if bruto else []
+                    colunas_rel = {c.name: c for c in modelo.__table__.columns}
+                    for item in itens:
+                        dados_rel = {
+                            nome_campo: _converter_valor_coluna_backup(coluna, item.get(nome_campo))
+                            for nome_campo, coluna in colunas_rel.items()
+                            if nome_campo in item and item.get(nome_campo) not in (None, '')
+                        }
+                        dados_rel['cadastro_id'] = cadastro.id
+                        db.session.add(modelo(**dados_rel))
+
+                docs = json.loads(linha.get('documentos_json') or '[]')
+                for doc in docs:
+                    conteudo_b64 = doc.pop('arquivo_base64', None)
+                    nome_arquivo = secure_filename(doc.get('nome_arquivo') or f'documento_{cadastro.id}')
+                    nome_destino = f"backup_{cadastro.id}_{doc.get('id', 'doc')}_{nome_arquivo}"
+                    caminho = os.path.join(app.config['UPLOAD_FOLDER'], nome_destino)
+                    if conteudo_b64:
+                        with open(caminho, 'wb') as destino:
+                            destino.write(base64.b64decode(conteudo_b64))
+                        doc['path_arquivo'] = caminho
+                    elif doc.get('path_arquivo'):
+                        # Caminho antigo não é válido no novo servidor; mantém referência como metadado.
+                        doc['path_arquivo'] = os.path.join(app.config['UPLOAD_FOLDER'], nome_destino)
+                    colunas_doc = {c.name: c for c in Documento.__table__.columns}
+                    dados_doc = {
+                        nome_campo: _converter_valor_coluna_backup(coluna, doc.get(nome_campo))
+                        for nome_campo, coluna in colunas_doc.items()
+                        if nome_campo in doc and doc.get(nome_campo) not in (None, '')
+                    }
+                    dados_doc['cadastro_id'] = cadastro.id
+                    if not dados_doc.get('path_arquivo'):
+                        dados_doc['path_arquivo'] = os.path.join(app.config['UPLOAD_FOLDER'], nome_destino)
+                    db.session.add(Documento(**dados_doc))
+
+            # Recria as tabelas de referência que alimentam VVT/VVC/IPTU.
+            for item in metadados.get('padroes_construtivos', []):
+                db.session.add(PadraoConstrutivo(**item))
+            for item in metadados.get('valores_logradouro', []):
+                db.session.add(ValorLogradouro(**item))
+            for item in metadados.get('aliquotas_iptu', []):
+                db.session.add(AliquotaIPTU(**item))
+
+            db.session.commit()
+            # Sincroniza sequências PostgreSQL após restaurar IDs explícitos.
+            if db.engine.dialect.name == 'postgresql':
+                for tabela in ('cadastros_reurb', 'construcoes', 'guias_iptu', 'documentos',
+                               'padroes_construtivos', 'valores_logradouro', 'aliquotas_iptu'):
+                    db.session.execute(sql_text(
+                        "SELECT setval(pg_get_serial_sequence(:tabela, 'id'), "
+                        "COALESCE((SELECT MAX(id) FROM " + tabela + "), 1), "
+                        "(SELECT MAX(id) IS NOT NULL FROM " + tabela + "))"
+                    ), {'tabela': tabela})
+                db.session.commit()
+            return jsonify({'mensagem': 'Backup integral restaurado com sucesso!', 'cadastros': len(ids_cadastros)}), 200
+
+        # Importação convencional de planilhas continua disponível e mantém o fluxo antigo.
+        column_mapping = {
+            'Nome do Requerente': 'req_nome', 'CPF do Requerente': 'req_cpf',
+            'Inscrição Imobiliária': 'inscricao_imobiliaria',
+            'Área Total do Lote (m²)': 'imovel_area_total',
+            'Renda Familiar (R$)': 'reurb_renda_familiar'
+        }
+        for linha in linhas:
+            linha = {column_mapping.get(k, k): v for k, v in linha.items()}
+            valid_data = {k: v for k, v in linha.items()
+                          if k in CadastroReurb.__table__.columns.keys()}
+            db.session.add(CadastroReurb(**valid_data))
+        db.session.commit()
+        return jsonify({'mensagem': f'{len(linhas)} registros importados com sucesso.'}), 200
+    except Exception as e:
+        db.session.rollback()
+        app.logger.exception('Erro ao importar arquivo REURB')
+        return jsonify({'erro': f'Erro ao importar dados: {str(e)}'}), 500
 
 # ------------------- UPLOAD DE DOCUMENTOS -------------------
 @app.route('/api/upload_documento/<int:id>', methods=['POST'])
