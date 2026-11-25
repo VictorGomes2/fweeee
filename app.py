@@ -153,6 +153,11 @@ class CadastroReurb(db.Model):
     imovel_medida_ld = db.Column(db.Float, nullable=True)
     imovel_medida_le = db.Column(db.Float, nullable=True)
     imovel_area_total = db.Column(db.Float)
+    imovel_placa_solar = db.Column(db.String(10), nullable=True)
+    avaliacao_judicial = db.Column(db.String(10), nullable=False, default='nao')
+    vvt_manual = db.Column(db.Float, nullable=True)
+    vvc_manual = db.Column(db.Float, nullable=True)
+    vvi_manual = db.Column(db.Float, nullable=True)
     # Geometria do lote em GeoJSON EPSG:4326 (longitude/latitude).
     geometria_lote = db.Column(db.Text, nullable=True)
     imovel_data_ocupacao = db.Column(db.String(20), nullable=True)
@@ -229,7 +234,7 @@ class GuiaIPTU(db.Model):
             'cadastro_id': self.cadastro_id,
             'ano_exercicio': self.ano_exercicio,
             'valor_emitido': self.valor_emitido,
-            'data_emissao': self.data_emissao.strftime('%d/%m/%Y %H:%M:%S'),
+            'data_emissao': (self.data_emissao.isoformat() + 'Z') if self.data_emissao else None,
             'situacao': self.situacao,
         }
 
@@ -274,57 +279,49 @@ class CalculoTributarioService:
         vvt, vvc, vvi, iptu = 0.0, 0.0, 0.0, 0.0
         tipo_uso_aplicado = None
         try:
-            # 1. Calcular VVT (Valor Venal do Terreno)
-            area_total_terreno = float(cadastro.imovel_area_total or 0.0)
+            avaliacao_judicial = str(getattr(cadastro, 'avaliacao_judicial', 'nao') or 'nao').strip().lower() in ('sim', 'true', '1', 'on')
 
-            if cadastro.imovel_logradouro and area_total_terreno > 0:
-                # Busca ignorando case
-                logradouro = ValorLogradouro.query.filter(func.lower(ValorLogradouro.logradouro) == func.lower(cadastro.imovel_logradouro)).first()
-                if logradouro:
-                    vvt = area_total_terreno * logradouro.valor_m2
-            
-            # 2. Calcular VVC (Valor Venal das Construções somadas)
-            if cadastro.construcoes:
-                for construcao in cadastro.construcoes:
-                    area_construida = float(construcao.area_construida or 0.0)
-                    if construcao.padrao_construtivo and area_construida > 0:
-                        # Busca ignorando case
-                        padrao = PadraoConstrutivo.query.filter(func.lower(PadraoConstrutivo.descricao) == func.lower(construcao.padrao_construtivo)).first()
-                        if padrao:
-                            vvc += (area_construida * padrao.valor_m2)
-            
-            # 3. Calcular VVI (Valor Venal do Imóvel)
-            vvi = vvt + vvc
+            if avaliacao_judicial:
+                # Avaliação judicial: utiliza exclusivamente os valores venais informados no cadastro.
+                vvt = float(cadastro.vvt_manual or 0.0)
+                vvc = float(cadastro.vvc_manual or 0.0)
+                vvi = float(cadastro.vvi_manual or (vvt + vvc))
+            else:
+                # Avaliação convencional: calcula VVT e VVC pela PGV.
+                area_total_terreno = float(cadastro.imovel_area_total or 0.0)
+                if cadastro.imovel_logradouro and area_total_terreno > 0:
+                    logradouro = ValorLogradouro.query.filter(func.lower(ValorLogradouro.logradouro) == func.lower(cadastro.imovel_logradouro)).first()
+                    if logradouro:
+                        vvt = area_total_terreno * logradouro.valor_m2
 
-            # 4. Descobrir o Tipo de Uso (Lógica de fallback)
-            tipo_uso = getattr(cadastro, 'const_uso', None) or                        getattr(cadastro, 'uso_principal', None) or                        getattr(cadastro, 'uso_imovel', None)
+                if cadastro.construcoes:
+                    for construcao in cadastro.construcoes:
+                        area_construida = float(construcao.area_construida or 0.0)
+                        if construcao.padrao_construtivo and area_construida > 0:
+                            padrao = PadraoConstrutivo.query.filter(func.lower(PadraoConstrutivo.descricao) == func.lower(construcao.padrao_construtivo)).first()
+                            if padrao:
+                                vvc += area_construida * padrao.valor_m2
+                vvi = vvt + vvc
 
-            # Fallback para a primeira construção se não encontrar no imóvel principal
+            tipo_uso = getattr(cadastro, 'const_uso', None) or getattr(cadastro, 'uso_principal', None) or getattr(cadastro, 'uso_imovel', None)
             if not tipo_uso and cadastro.construcoes and len(cadastro.construcoes) > 0:
                 uso_const = getattr(cadastro.construcoes[0], 'uso_principal', None)
-                if uso_const and uso_const != 'N/D':
-                    tipo_uso = uso_const
-                else:
-                    tipo_uso = getattr(cadastro.construcoes[0], 'const_uso', None)
-            
+                tipo_uso = uso_const if uso_const and uso_const != 'N/D' else getattr(cadastro.construcoes[0], 'const_uso', None)
             tipo_uso_aplicado = tipo_uso
 
-            # 5. Calcular IPTU
+            # A alíquota permanece vinculada ao uso cadastrado; na avaliação judicial,
+            # somente a base venal deixa de ser obtida pelos valores de terreno/construção da PGV.
             if vvi > 0 and tipo_uso:
-                # Busca a alíquota exata ignorando case e espaços nas bordas
                 aliquota_data = AliquotaIPTU.query.filter(func.lower(func.trim(AliquotaIPTU.tipo)) == func.lower(tipo_uso.strip())).first()
                 if aliquota_data:
                     iptu = vvi * aliquota_data.aliquota
-
         except Exception as e:
             print(f"Erro no cálculo: {e}")
-            
+
         return {
-            "vvt": vvt, 
-            "vvc": vvc, 
-            "vvi": vvi, 
-            "iptu": iptu, 
-            "tipo_uso_aplicado": tipo_uso_aplicado
+            "vvt": vvt, "vvc": vvc, "vvi": vvi, "iptu": iptu,
+            "tipo_uso_aplicado": tipo_uso_aplicado,
+            "avaliacao_judicial": 'sim' if str(getattr(cadastro, 'avaliacao_judicial', 'nao') or 'nao').strip().lower() in ('sim', 'true', '1', 'on') else 'nao'
         }
 
 # =======================================================================
@@ -495,12 +492,17 @@ def admin_required(f):
     return decorated
 
 
-# Compatibilidade com bancos já existentes: cria apenas as duas colunas espaciais novas.
+# Compatibilidade com bancos já existentes: adiciona colunas espaciais e novos campos cadastrais sem apagar dados.
 def garantir_colunas_geometrias():
     try:
         with db.engine.begin() as conexao:
             conexao.execute(sql_text("ALTER TABLE cadastros_reurb ADD COLUMN IF NOT EXISTS geometria_lote TEXT"))
             conexao.execute(sql_text("ALTER TABLE construcoes ADD COLUMN IF NOT EXISTS geometria TEXT"))
+            conexao.execute(sql_text("ALTER TABLE cadastros_reurb ADD COLUMN IF NOT EXISTS imovel_placa_solar VARCHAR(10)"))
+            conexao.execute(sql_text("ALTER TABLE cadastros_reurb ADD COLUMN IF NOT EXISTS avaliacao_judicial VARCHAR(10) NOT NULL DEFAULT 'nao'"))
+            conexao.execute(sql_text("ALTER TABLE cadastros_reurb ADD COLUMN IF NOT EXISTS vvt_manual DOUBLE PRECISION"))
+            conexao.execute(sql_text("ALTER TABLE cadastros_reurb ADD COLUMN IF NOT EXISTS vvc_manual DOUBLE PRECISION"))
+            conexao.execute(sql_text("ALTER TABLE cadastros_reurb ADD COLUMN IF NOT EXISTS vvi_manual DOUBLE PRECISION"))
     except Exception as erro:
         app.logger.warning(f"Não foi possível verificar/criar colunas de geometria: {erro}")
 
@@ -575,6 +577,11 @@ def cadastrar_reurb(current_user):
             imovel_medida_ld=to_float(data.get('imovel_medida_ld')),
             imovel_medida_le=to_float(data.get('imovel_medida_le')),
             imovel_area_total=to_float(data.get('imovel_area_total')),
+            imovel_placa_solar=data.get('imovel_placa_solar'),
+            avaliacao_judicial='sim' if str(data.get('avaliacao_judicial', 'nao')).strip().lower() in ('sim', 'true', '1', 'on') else 'nao',
+            vvt_manual=to_float(data.get('vvt_manual')),
+            vvc_manual=to_float(data.get('vvc_manual')),
+            vvi_manual=to_float(data.get('vvi_manual')),
             imovel_data_ocupacao=data.get('imovel_data_ocupacao'),
             imovel_infra_agua=data.get('imovel_infra_agua'), imovel_infra_esgoto=data.get('imovel_infra_esgoto'),
             imovel_infra_iluminacao=data.get('imovel_infra_iluminacao'),
@@ -887,8 +894,10 @@ def gerenciar_cadastro_por_id(current_user, id):
         data = request.get_json()
         for key, value in data.items():
             if hasattr(cadastro, key) and key not in ['id', 'construcoes', 'documentos']:
-                if key in ['latitude', 'longitude', 'imovel_medida_frente', 'imovel_medida_fundo', 'imovel_medida_ld', 'imovel_medida_le', 'imovel_area_total', 'reurb_renda_familiar']:
+                if key in ['latitude', 'longitude', 'imovel_medida_frente', 'imovel_medida_fundo', 'imovel_medida_ld', 'imovel_medida_le', 'imovel_area_total', 'reurb_renda_familiar', 'vvt_manual', 'vvc_manual', 'vvi_manual']:
                     setattr(cadastro, key, to_float(value))
+                elif key == 'avaliacao_judicial':
+                    cadastro.avaliacao_judicial = 'sim' if str(value).strip().lower() in ('sim', 'true', '1', 'on') else 'nao'
                 elif key == 'imovel_num_habitantes':
                     setattr(cadastro, key, to_int(value))
                 else:
@@ -1110,7 +1119,7 @@ def listar_todas_as_guias(current_user):
                 'cadastro_id': guia.cadastro_id,
                 'ano_exercicio': guia.ano_exercicio,
                 'valor_emitido': guia.valor_emitido,
-                'data_emissao': guia.data_emissao.strftime('%d/%m/%Y %H:%M:%S'),
+                'data_emissao': (guia.data_emissao.isoformat() + 'Z') if guia.data_emissao else None,
                 'situacao': guia.situacao,
                 'nome_proprietario': nome,
                 'cpf': cpf,
