@@ -20,6 +20,26 @@
     <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <!-- Ponte de comunicação entre o HTML e o Python do complemento QGIS -->
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+    <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            if (typeof qt !== "undefined" && qt.webChannelTransport && typeof QWebChannel !== "undefined") {
+                new QWebChannel(qt.webChannelTransport, function(channel) {
+                    window.qgisBackend = channel.objects.qgisBackend;
+                    if (window.qgisBackend.construcaoCapturada) {
+                        window.qgisBackend.construcaoCapturada.connect(function(payload) {
+                            try { preencherCapturaConstrucaoQGIS(JSON.parse(payload)); }
+                            catch (e) { console.error('Falha ao receber feição de construção:', e); }
+                        });
+                    }
+                    console.log("Comunicação com o QGIS estabelecida com sucesso!");
+                });
+            } else {
+                console.warn("API do Qt não encontrada. A vinculação só funciona dentro do complemento QGIS.");
+            }
+        });
+    </script>
 
     <style>
         /* ================================================================ */
@@ -2260,6 +2280,135 @@
 <!-- ======================================================================= -->
 <!-- APLICATIVO PRINCIPAL                                                    -->
 <!-- ======================================================================= -->
+<div id="modal-vinculo-qgis" class="modal-overlay" style="z-index:9999;">
+    <div class="modal-content" style="max-width:440px; padding:25px;">
+        <h3 style="margin-top:0; color:#333; margin-bottom:15px; border-bottom:1px solid #eee; padding-bottom:10px;">
+            Vincular cadastro ao lote
+        </h3>
+        <p style="font-size:0.9rem; color:#666; line-height:1.45; margin:0 0 15px;">
+            Selecione o cadastro do proprietário. Em seguida, clique no polígono correspondente na camada vetorial ativa do QGIS.
+        </p>
+        <label for="filtro-proprietario-vinculo" style="display:block; margin-bottom:6px; font-weight:bold; color:#555;">Buscar por nome, inscrição imobiliária ou CPF:</label>
+        <input id="filtro-proprietario-vinculo" type="search" placeholder="Digite nome, inscrição ou CPF" oninput="filtrarProprietariosVinculo()" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccc;border-radius:7px;margin-bottom:10px;">
+        <label for="select-proprietario-vinculo" style="display:block; margin-bottom:8px; font-weight:bold; color:#555;">
+            Selecione o proprietário:
+        </label>
+        <select id="select-proprietario-vinculo"
+            style="width:100%; padding:11px; border:1px solid #ccc; border-radius:7px; margin-bottom:20px; font-size:14px; background:#fff;">
+            <option value="">-- Selecione um cadastro --</option>
+        </select>
+        <div style="display:flex; justify-content:flex-end; gap:10px;">
+            <button type="button" onclick="fecharModalVinculo()"
+                style="background:#6c757d; color:#fff; border:0; padding:9px 15px; border-radius:6px; cursor:pointer;">
+                Cancelar
+            </button>
+            <button type="button" onclick="avancarParaCliqueMapa()"
+                style="background:#28a745; color:#fff; border:0; padding:9px 15px; border-radius:6px; font-weight:bold; cursor:pointer;">
+                Avançar para o mapa
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Seleção do proprietário para vincular edificações -->
+<div id="modal-vinculo-edificacao-qgis" class="modal-overlay" style="z-index:10000;">
+    <div class="modal-content" style="max-width:460px; padding:25px;">
+        <h3 style="margin-top:0; color:#333; border-bottom:1px solid #eee; padding-bottom:10px;">Vincular Edificação ao Lote</h3>
+        <p style="font-size:.9rem; color:#666; line-height:1.45;">Selecione o proprietário. O gerenciador exibirá as construções já cadastradas e permitirá adicionar as feições do QGIS.</p>
+        <label for="filtro-proprietario-edificacao" style="display:block; margin-bottom:6px; font-weight:bold;">Buscar por nome, inscrição imobiliária ou CPF:</label>
+        <input id="filtro-proprietario-edificacao" type="search" placeholder="Digite nome, inscrição ou CPF" oninput="filtrarProprietariosEdificacao()" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccc;border-radius:7px;margin-bottom:10px;">
+        <label for="select-proprietario-edificacao" style="display:block; margin-bottom:8px; font-weight:bold;">Proprietário:</label>
+        <select id="select-proprietario-edificacao" style="width:100%; padding:11px; border:1px solid #ccc; border-radius:7px; margin-bottom:20px; background:#fff;">
+            <option value="">-- Selecione um cadastro --</option>
+        </select>
+        <div style="display:flex; justify-content:flex-end; gap:10px;">
+            <button type="button" onclick="fecharModalVinculoEdificacao()" style="background:#6c757d;color:white;border:0;padding:9px 15px;border-radius:6px;">Cancelar</button>
+            <button type="button" onclick="abrirGerenciadorEdificacoesQGIS()" style="background:#198754;color:white;border:0;padding:9px 15px;border-radius:6px;font-weight:bold;">Abrir gerenciador</button>
+        </div>
+    </div>
+</div>
+
+<!-- Gerenciador específico do proprietário selecionado -->
+<div id="modal-gerenciador-edificacoes-qgis" class="modal-overlay" style="z-index:10001;">
+    <div class="modal-content" style="max-width:900px; width:96%; max-height:92vh; overflow:auto; padding:22px;">
+        <div class="sheet-header">
+            <h3 id="titulo-gerenciador-edificacoes">Construções do proprietário</h3>
+            <button class="btn-close-sheet" onclick="fecharGerenciadorEdificacoesQGIS()">×</button>
+        </div>
+        <p id="orientacao-captura-edificacao" style="color:#555; font-size:.9rem;">Carregando construções cadastradas...</p>
+        <div style="overflow-x:auto; margin:12px 0 20px;">
+            <table style="width:100%; border-collapse:collapse; font-size:.86rem;">
+                <thead><tr style="background:#f3f3f3;">
+                    <th style="padding:9px; text-align:left;">ID</th><th style="padding:9px; text-align:left;">Construção</th><th style="padding:9px; text-align:right;">Área (m²)</th><th style="padding:9px; text-align:left;">Padrão</th><th style="padding:9px; text-align:center;">Ações</th>
+                </tr></thead>
+                <tbody id="lista-construcoes-qgis"><tr><td colspan="5" style="padding:12px;text-align:center;">Carregando...</td></tr></tbody>
+            </table>
+        </div>
+        <div style="border-top:1px solid #ddd; padding-top:16px;">
+            <h4 style="border-bottom:1px solid #eee; padding-bottom:10px; margin:0 0 15px; color:var(--primary);">Adicionar/Editar Construção</h4>
+            <div id="status-captura-edificacao" style="padding:10px; background:#f5f5f5; border-radius:7px; margin-bottom:12px; font-size:.9rem;">Clique no polígono da construção no mapa. A área será preenchida automaticamente.</div>
+            <form id="form-construcao-qgis" onsubmit="salvarConstrucaoCapturadaQGIS(event)">
+                <input type="hidden" id="qgis-construcao-layer-id"><input type="hidden" id="qgis-construcao-feature-id"><input type="hidden" id="qgis-construcao-id">
+                <input type="hidden" id="qgis-const-uso"><input type="hidden" id="qgis-const-tipo">
+                <div class="form-grid">
+                    <div class="form-field">
+                        <label for="qgis-const-nome">Nome da Construção (Ex: Casa Principal, Edícula):</label>
+                        <input id="qgis-const-nome" required>
+                    </div>
+                    <div class="form-field">
+                        <label for="qgis-const-area">Área Construída (m²):</label>
+                        <input id="qgis-const-area" type="number" step="0.01" required inputmode="decimal">
+                    </div>
+                    <div class="form-field">
+                        <label for="qgis-const-padrao">Padrão Construtivo:</label>
+                        <select id="qgis-const-padrao" required></select>
+                    </div>
+                </div>
+
+                <h4 style="color:var(--primary); margin-top:1.5rem; margin-bottom:0.5rem;">Características Construtivas (Estrutura)</h4>
+                <div class="form-grid">
+                    <div class="form-field">
+                        <label for="qgis-const-estrutura">Estrutura:</label>
+                        <select id="qgis-const-estrutura"><option value="">Selecione...</option></select>
+                    </div>
+                    <div class="form-field">
+                        <label for="qgis-const-cobertura">Cobertura:</label>
+                        <select id="qgis-const-cobertura"><option value="">Selecione...</option></select>
+                    </div>
+                    <div class="form-field">
+                        <label for="qgis-const-sanitario">Inst. Sanitárias:</label>
+                        <select id="qgis-const-sanitario"><option value="">Selecione...</option></select>
+                    </div>
+                    <div class="form-field">
+                        <label for="qgis-const-forro">Forro:</label>
+                        <select id="qgis-const-forro"><option value="">Selecione...</option></select>
+                    </div>
+                    <div class="form-field">
+                        <label for="qgis-const-piso">Piso:</label>
+                        <select id="qgis-const-piso"><option value="">Selecione...</option></select>
+                    </div>
+                    <div class="form-field">
+                        <label for="qgis-const-portas">Portas:</label>
+                        <select id="qgis-const-portas"><option value="">Selecione...</option></select>
+                    </div>
+                    <div class="form-field">
+                        <label for="qgis-const-janelas">Janelas:</label>
+                        <select id="qgis-const-janelas"><option value="">Selecione...</option></select>
+                    </div>
+                    <div class="form-field">
+                        <label for="qgis-const-revestimento">Revest. Externo:</label>
+                        <select id="qgis-const-revestimento"><option value="">Selecione...</option></select>
+                    </div>
+                </div>
+
+                <div class="btn-container" style="margin-top:10px;">
+                    <button type="submit" class="btn-mobile" style="background:var(--success); color:white;">+ Adicionar à Lista</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
 <div id="app-container">
 
 <header>
@@ -2284,6 +2433,29 @@
 
 		<div id="Início" class="tab-content">
 
+            <div style="display:flex; justify-content:flex-end; margin:0 0 10px 0;">
+                <button id="btn-sincronizar-cadastro" type="button" onclick="abrirModalVinculo()"
+                    style="background:#007bff; color:#fff; border:0; padding:10px 16px; border-radius:8px; font-weight:700; cursor:pointer; display:inline-flex; align-items:center; gap:8px;">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                        <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                    </svg>
+                    Vincular Cadastro ao Lote
+                </button>
+                <button id="btn-atualizar-areas-qgis" type="button" onclick="sincronizarAreasLotesQGIS()"
+                    style="background:#198754; color:#fff; border:0; padding:10px 16px; border-radius:8px; font-weight:700; cursor:pointer; display:inline-flex; align-items:center; gap:8px; margin-left:8px;">
+                    Atualizar áreas + centroides dos lotes vinculados
+                </button>
+            </div>
+            <div style="display:flex; justify-content:flex-end; gap:8px; margin:0 0 10px 0; flex-wrap:wrap;">
+                <button id="btn-vincular-edificacao-qgis" type="button" onclick="abrirModalVinculoEdificacao()"
+                    style="background:#007bff; color:#fff; border:0; padding:10px 16px; border-radius:8px; font-weight:700; cursor:pointer;">
+                    Vincular Edificação ao Lote
+                </button>
+                <button id="btn-atualizar-areas-construcoes-qgis" type="button" onclick="sincronizarAreasConstrucoesQGIS()"
+                    style="background:#198754; color:#fff; border:0; padding:10px 16px; border-radius:8px; font-weight:700; cursor:pointer;">
+                    Atualizar áreas das construções dos lotes vinculados
+                </button>
+            </div>
             <div class="dashboard-filters">
                 <div class="filter-group">
                     <label for="filtro-periodo">Período:</label>
@@ -3868,7 +4040,7 @@ function configuringVisibilidadeAdmin() {
         document.getElementById('boleto-iptu-container').innerHTML = '';
 
         const actions = {
-            'Início': () => { inicializarMapaPrincipal(); carregarDashboard(); carregarAtividadesRecentes(); },
+            'Início': () => { inicializarMapaPrincipal(); carregarTodosCadastros(); carregarDashboard(); carregarAtividadesRecentes(); },
             'cadastro': () => { fecharFormularioWizard(); carregarTodosCadastros(); },
             'plantaGenerica': () => mostrarSubAbaPlantaGenerica('padroes'),
             'GerarIPTU': carregarTabelaControleIPTU,
@@ -3906,7 +4078,22 @@ function configuringVisibilidadeAdmin() {
         };
 
         dashboardMap = L.map(mapaContainer, { center: [-12.515, -38.496], zoom: 15, layers: [googleHybrid], tap: false });
-        mapLayerControl = L.control.layers(baseLayers, {}).addTo(dashboardMap);
+        window.dashboardLotLayer = L.featureGroup().addTo(dashboardMap);
+        window.dashboardConstructionLayer = L.featureGroup().addTo(dashboardMap);
+        window.dashboardCentroidLayer = L.featureGroup().addTo(dashboardMap);
+        mapLayerControl = L.control.layers(baseLayers, {
+            'Polígonos de lotes': window.dashboardLotLayer,
+            'Polígonos de construções': window.dashboardConstructionLayer,
+            'Alfinetes (centroide do lote)': window.dashboardCentroidLayer
+        }, {collapsed:true}).addTo(dashboardMap);
+        const legendaGeometrias = L.control({position:'bottomleft'});
+        legendaGeometrias.onAdd = function() {
+            const div = L.DomUtil.create('div', 'info legend');
+            div.style.cssText = 'background:#fff;padding:7px 10px;border-radius:6px;box-shadow:0 1px 5px #777;font:12px Arial;line-height:1.7;';
+            div.innerHTML = '<span style="color:#f0a202;font-weight:bold">▰</span> Lote<br><span style="color:#d62828;font-weight:bold">▰</span> Construção<br><span style="color:#1e5aa8;font-weight:bold">📍</span> Centroide';
+            return div;
+        };
+        legendaGeometrias.addTo(dashboardMap);
         
         // O dashboard é somente um mapa de localização e consulta dos cadastros.
         // As ferramentas de desenho/análise permanecem exclusivamente no mapa temático.
@@ -3915,44 +4102,105 @@ function configuringVisibilidadeAdmin() {
         setTimeout(() => dashboardMap.invalidateSize(), 150);
     }
     
-    // Marcadores simples no dashboard: cada ponto abre a ficha e permite editar.
+    // No dashboard, os pontos deixam de ser exibidos. A consulta e as ações
+    // Visualizar/Editar passam a ser abertas diretamente pelos polígonos.
     function atualizarMarcadoresDashboard(cadastros) {
         if (!dashboardMap) return;
-        if (dashboardMarkersLayer) dashboardMap.removeLayer(dashboardMarkersLayer);
-        dashboardMarkersLayer = L.layerGroup().addTo(dashboardMap);
-
-        const registros = (cadastros || []).filter(c => {
-            const lat = Number(c.latitude);
-            const lng = Number(c.longitude);
-            return Number.isFinite(lat) && Number.isFinite(lng) && lat !== 0 && lng !== 0;
+        if (dashboardMarkersLayer) {
+            dashboardMap.removeLayer(dashboardMarkersLayer);
+            dashboardMarkersLayer = null;
+        }
+        [window.dashboardLotLayer, window.dashboardConstructionLayer, window.dashboardCentroidLayer].forEach(layer => {
+            if (layer) layer.clearLayers();
         });
+        if (!window.dashboardLotLayer) window.dashboardLotLayer = L.featureGroup().addTo(dashboardMap);
+        if (!window.dashboardConstructionLayer) window.dashboardConstructionLayer = L.featureGroup().addTo(dashboardMap);
+        if (!window.dashboardCentroidLayer) window.dashboardCentroidLayer = L.featureGroup().addTo(dashboardMap);
 
-        registros.forEach(c => {
-            const lat = Number(c.latitude);
-            const lng = Number(c.longitude);
+        const escaparHtml = (valor) => String(valor ?? '').replace(/[&<>"']/g, ch => ({
+            '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+        }[ch]));
+
+        (cadastros || []).forEach(c => {
+            const nome = escaparHtml(c.req_nome || 'Cadastro sem identificação');
+            const inscricao = escaparHtml(c.inscricao_imobiliaria || 'Não informada');
             const idSeguro = JSON.stringify(String(c.id));
-            const nome = String(c.req_nome || 'Cadastro sem identificação')
-                .replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-            const inscricao = String(c.inscricao_imobiliaria || 'Não informada')
-                .replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-            const marker = L.marker([lat, lng], { icon: markerIcons.default });
-            marker.bindPopup(`
-                <div style="min-width:210px; font-family:Arial,sans-serif;">
-                    <strong style="color:#6b4f43;">${nome}</strong>
-                    <div style="font-size:12px; margin:5px 0 10px;">Inscrição: ${inscricao}</div>
-                    <div style="display:flex; gap:6px;">
+
+            const popupCadastro = (titulo, area) => `
+                <div style="min-width:230px;font-family:Arial,sans-serif;">
+                    <div style="font-weight:700;color:#6b4f43;margin-bottom:6px;">${escaparHtml(titulo)}</div>
+                    <div style="margin:4px 0;"><strong>Proprietário:</strong> ${nome}</div>
+                    <div style="margin:4px 0 10px;"><strong>Inscrição imobiliária:</strong> ${inscricao}</div>
+                    <div style="margin:4px 0 10px;"><strong>Área:</strong> ${Number(area || 0).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2})} m²</div>
+                    <div style="display:flex;gap:7px;">
                         <button type="button" onclick='visualizarCadastro(${idSeguro})'
-                            style="flex:1; padding:7px 9px; border:0; border-radius:6px; background:#007bff; color:white; cursor:pointer;">👁 Visualizar</button>
+                            style="flex:1;padding:8px 9px;border:0;border-radius:6px;background:#007bff;color:#fff;cursor:pointer;">👁 Visualizar</button>
                         <button type="button" onclick='editarCadastro(${idSeguro})'
-                            style="flex:1; padding:7px 9px; border:0; border-radius:6px; background:#bda46b; color:#2c221e; cursor:pointer;">✏ Editar</button>
+                            style="flex:1;padding:8px 9px;border:0;border-radius:6px;background:#bda46b;color:#2c221e;cursor:pointer;">✏ Editar</button>
                     </div>
-                </div>`);
-            marker.addTo(dashboardMarkersLayer);
+                </div>`;
+
+            const adicionarPoligono = (valor, estilo, titulo, area, camadaDestino) => {
+                if (!valor) return;
+                try {
+                    const geometria = typeof valor === 'string' ? JSON.parse(valor) : valor;
+                    if (!geometria || !['Polygon', 'MultiPolygon'].includes(geometria.type)) return;
+                    const camada = L.geoJSON(geometria, {
+                        style: estilo,
+                        interactive: true,
+                        onEachFeature: (_feature, layer) => {
+                            layer.bindPopup(popupCadastro(titulo, area), {maxWidth:320});
+                            layer.on('mouseover', function() {
+                                if (this.setStyle) this.setStyle({weight:4, fillOpacity:0.24});
+                            });
+                            layer.on('mouseout', function() {
+                                if (this.setStyle) this.setStyle(estilo);
+                            });
+                        }
+                    });
+                    camada.addTo(camadaDestino);
+                } catch (erro) {
+                    console.warn('Geometria inválida no cadastro ' + c.id, erro);
+                }
+            };
+
+            adicionarPoligono(
+                c.geometria_lote,
+                {color:'#f0a202', weight:3, opacity:0.95, fillColor:'#f0a202', fillOpacity:0.12},
+                'Lote', c.imovel_area_total, window.dashboardLotLayer
+            );
+
+            // Alfinete compacto no centroide: abre a mesma ficha dos polígonos.
+            if (Number.isFinite(Number(c.latitude)) && Number.isFinite(Number(c.longitude)) &&
+                    c.latitude !== null && c.longitude !== null && c.latitude !== '' && c.longitude !== '') {
+                const pinIcon = L.divIcon({
+                    className: 'cmreurb-centroid-pin-wrap',
+                    html: '<span style="display:block;width:13px;height:13px;background:#1e5aa8;border:2px solid #fff;border-radius:50% 50% 50% 0;transform:rotate(-45deg);box-shadow:0 1px 4px #333;"></span>',
+                    iconSize: [17,17], iconAnchor: [8,14], popupAnchor: [0,-13]
+                });
+                const pin = L.marker([Number(c.latitude), Number(c.longitude)], {icon:pinIcon, keyboard:true, title:'Centroide do lote'});
+                pin.bindPopup(popupCadastro('Lote (centroide)', c.imovel_area_total), {maxWidth:320});
+                pin.on('click', function(){ this.openPopup(); });
+                pin.addTo(window.dashboardCentroidLayer);
+            }
+
+            (c.construcoes || []).forEach((construcao, indice) => {
+                adicionarPoligono(
+                    construcao.geometria,
+                    {color:'#d62828', weight:2.5, opacity:0.95, fillColor:'#d62828', fillOpacity:0.28},
+                    'Construção ' + (construcao.nome || (indice + 1)),
+                    construcao.area_construida, window.dashboardConstructionLayer
+                );
+            });
         });
 
-        if (registros.length) {
-            const bounds = L.latLngBounds(registros.map(c => [Number(c.latitude), Number(c.longitude)]));
-            dashboardMap.fitBounds(bounds.pad(0.15), { maxZoom: 17 });
+        // Enquadra lotes, edificações e centroides, independentemente das camadas ligadas.
+        const todasGeometrias = L.featureGroup([
+            window.dashboardLotLayer, window.dashboardConstructionLayer, window.dashboardCentroidLayer
+        ]);
+        if (todasGeometrias.getLayers().length) {
+            const boundsGeometrias = todasGeometrias.getBounds();
+            if (boundsGeometrias.isValid()) dashboardMap.fitBounds(boundsGeometrias.pad(0.12), {maxZoom:18});
         }
     }
 
@@ -3984,7 +4232,10 @@ function configuringVisibilidadeAdmin() {
         };
 
         crfMap = L.map(mapaContainer, { center: [-12.515, -38.496], zoom: 15, layers: [googleHybrid], tap: false });
-        crfMapLayerControl = L.control.layers(baseLayers, {}).addTo(crfMap);
+        window.crfLotPolygonsLayer = L.featureGroup().addTo(crfMap);
+        crfMapLayerControl = L.control.layers(baseLayers, {
+            'Polígonos dos lotes': window.crfLotPolygonsLayer
+        }, {collapsed:false}).addTo(crfMap);
 
         const drawnItems = new L.FeatureGroup().addTo(crfMap);
         crfMap.addControl(new L.Control.Draw({ edit: { featureGroup: drawnItems } }));
@@ -4095,6 +4346,23 @@ function configuringVisibilidadeAdmin() {
         crfMarkersLayer?.remove();
         crfMarkersLayer = L.layerGroup().addTo(crfMap);
         crfMarkerRecords = [];
+        if (window.crfLotPolygonsLayer) window.crfLotPolygonsLayer.clearLayers();
+
+        // Mapa temático: mantém os pontos cadastrais e acrescenta os polígonos dos lotes.
+        (cadastros || []).forEach(c => {
+            if (!c || !c.geometria_lote || !window.crfLotPolygonsLayer) return;
+            try {
+                const geometry = typeof c.geometria_lote === 'string' ? JSON.parse(c.geometria_lote) : c.geometria_lote;
+                if (!geometry || !['Polygon','MultiPolygon'].includes(geometry.type)) return;
+                const polygon = L.geoJSON(geometry, {
+                    style: {color:'#f0a202', weight:2, fillColor:'#f0a202', fillOpacity:0.12},
+                    onEachFeature: (_feature, layer) => {
+                        layer.bindPopup(`<b>${String(c.req_nome || 'Cadastro').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}</b><br>Inscrição: ${String(c.inscricao_imobiliaria || 'N/I')}<br>Área: ${Number(c.imovel_area_total || 0).toLocaleString('pt-BR')} m²`);
+                    }
+                });
+                polygon.addTo(window.crfLotPolygonsLayer);
+            } catch (err) { console.warn('Geometria de lote inválida no mapa temático', c.id, err); }
+        });
 
         const cadastrosComCoord = (cadastros || []).filter(c => c.latitude && c.longitude);
         cadastrosComCoord.forEach(c => {
@@ -4104,8 +4372,10 @@ function configuringVisibilidadeAdmin() {
             crfMarkerRecords.push({ marker, cadastro: c });
         });
 
-        if (crfMarkerRecords.length > 0) {
-            crfMap.fitBounds(L.featureGroup(crfMarkerRecords.map(r => r.marker)).getBounds().pad(0.2));
+        const boundsTematicos = L.featureGroup([window.crfLotPolygonsLayer, crfMarkersLayer]);
+        if (boundsTematicos.getLayers().length) {
+            const bounds = boundsTematicos.getBounds();
+            if (bounds.isValid()) crfMap.fitBounds(bounds.pad(0.15), {maxZoom:18});
         }
         aplicarAnalise('situacao_atual');
     }
@@ -5228,22 +5498,29 @@ if (data.construcoes && data.construcoes.length > 0) {
         let url = editId ? `${API_URL}/api/cadastros/${editId}` : `${API_URL}/api/cadastrar_reurb`;
         let method = editId ? "PUT" : "POST";
 
-        fetch(url, { method, headers: getAuthHeaders(), body: JSON.stringify(data) })
-            .then(res => res.json())
-            .then(response => {
-                if (response.id || (response.mensagem && response.mensagem.includes('sucesso'))) {
-                    alert(`Cadastro ${editId ? 'atualizado' : 'salvo'} com sucesso!`);
-                    adicionarAtividadeRecente(`Cadastro de <strong>${data.req_nome}</strong> foi ${editId ? 'atualizado' : 'criado'} pelo cadastrador <strong>${data.cadastrador}</strong>.`);
-                    fecharFormularioWizard();
-                    carregarTodosCadastros();
-                } else {
-                    alert(`Erro ao salvar no banco: ${response.mensagem || response.erro}`);
-                }
-            })
-            .catch(error => {
-                console.error("Erro na requisição:", error);
-                alert("Ocorreu um erro ao comunicar com o servidor do banco.");
-            });
+        try {
+            const res = await fetch(url, { method, headers: getAuthHeaders(), body: JSON.stringify(data) });
+            const textoResposta = await res.text();
+            let response = {};
+            if (textoResposta && textoResposta.trim()) {
+                try { response = JSON.parse(textoResposta); } catch (_) { response = {}; }
+            }
+
+            if (res.ok && (response.id || response.sucesso || (response.mensagem && response.mensagem.toLowerCase().includes('sucesso')))) {
+                alert(`Cadastro ${editId ? 'atualizado' : 'salvo'} com sucesso!`);
+                adicionarAtividadeRecente(`Cadastro de <strong>${data.req_nome}</strong> foi ${editId ? 'atualizado' : 'criado'} pelo cadastrador <strong>${data.cadastrador}</strong>.`);
+                fecharFormularioWizard();
+                carregarTodosCadastros();
+            } else {
+                const detalhe = response.mensagem || response.erro ||
+                    (textoResposta && !textoResposta.trim().startsWith('<') ? textoResposta.trim() : '') ||
+                    `HTTP ${res.status}`;
+                alert(`Erro ao salvar no banco: ${detalhe}`);
+            }
+        } catch (error) {
+            console.error("Erro na requisição:", error);
+            alert("Ocorreu um erro ao comunicar com o servidor do banco: " + error.message);
+        }
     }
 
     async function synchronizingCadastrosOffline() {
@@ -8115,6 +8392,554 @@ function calcularValorTerreno(zonaDoImovel, areaDoTerreno) {
         return 0;
     }
 }
+
+
+    // ===================================================================
+    // VINCULAÇÃO DE CADASTRO AO LOTE NO QGIS
+    // Mantém a integração com QgisBackend definida em interface.py.
+    // ===================================================================
+    function normalizarFiltroProprietario(valor) {
+        return String(valor || '').toLocaleLowerCase('pt-BR').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '');
+    }
+
+    function cadastrosFiltradosPorProprietario(filtro) {
+        const termo = normalizarFiltroProprietario(filtro);
+        return (Array.isArray(todosOsCadastros) ? todosOsCadastros : []).filter(cad => {
+            if (!cad || !cad.req_nome) return false;
+            if (!termo) return true;
+            return [cad.req_nome, cad.inscricao_imobiliaria, cad.req_cpf]
+                .some(valor => normalizarFiltroProprietario(valor).includes(termo));
+        });
+    }
+
+    function filtrarProprietariosVinculo() {
+        const select = document.getElementById('select-proprietario-vinculo');
+        if (!select) return;
+        const atual = select.value;
+        select.innerHTML = '<option value="">-- Selecione um cadastro --</option>';
+        cadastrosFiltradosPorProprietario(document.getElementById('filtro-proprietario-vinculo')?.value).forEach(cad => {
+            const option = document.createElement('option');
+            option.value = JSON.stringify(cad);
+            option.textContent = `${cad.req_nome} (Insc: ${cad.inscricao_imobiliaria || 'S/N'} | CPF: ${cad.req_cpf || 'N/I'})`;
+            select.appendChild(option);
+        });
+        if ([...select.options].some(o => o.value === atual)) select.value = atual;
+    }
+
+    function filtrarProprietariosEdificacao() {
+        const select = document.getElementById('select-proprietario-edificacao');
+        if (!select) return;
+        const atual = select.value;
+        select.innerHTML = '<option value="">-- Selecione um cadastro --</option>';
+        cadastrosFiltradosPorProprietario(document.getElementById('filtro-proprietario-edificacao')?.value).forEach(cad => {
+            if (!cad.id) return;
+            const option = document.createElement('option');
+            option.value = String(cad.id);
+            option.textContent = `${cad.req_nome} (Insc: ${cad.inscricao_imobiliaria || 'S/N'} | CPF: ${cad.req_cpf || 'N/I'})`;
+            select.appendChild(option);
+        });
+        if ([...select.options].some(o => o.value === atual)) select.value = atual;
+    }
+
+    function abrirModalVinculo() {
+        const select = document.getElementById('select-proprietario-vinculo');
+        if (!select) {
+            alert('Não foi possível abrir a seleção de cadastros.');
+            return;
+        }
+
+        const filtro = document.getElementById('filtro-proprietario-vinculo');
+        if (filtro) filtro.value = '';
+        filtrarProprietariosVinculo();
+        if (select.options.length === 1) {
+            alert('Nenhum cadastro disponível para vinculação. Carregue ou sincronize os cadastros primeiro.');
+        }
+
+        document.getElementById('modal-vinculo-qgis').style.display = 'flex';
+    }
+
+    function fecharModalVinculo() {
+        const modal = document.getElementById('modal-vinculo-qgis');
+        if (modal) modal.style.display = 'none';
+    }
+
+    function avancarParaCliqueMapa() {
+        const select = document.getElementById('select-proprietario-vinculo');
+        const dadosCadastroJson = select ? select.value : '';
+
+        if (!dadosCadastroJson) {
+            alert('Por favor, selecione um proprietário da lista para prosseguir.');
+            return;
+        }
+
+        if (typeof window.qgisBackend === 'undefined' || !window.qgisBackend ||
+            typeof window.qgisBackend.iniciarFerramentaVinculo !== 'function') {
+            alert('Conexão com o QGIS não detectada. Esta função só funciona dentro do complemento QGIS.');
+            return;
+        }
+
+        fecharModalVinculo();
+        if (sessionStorage.getItem('modoOffline') === 'true') {
+            alert('A vinculação ao banco exige que o cadastro esteja online. Conecte-se e tente novamente.');
+            return;
+        }
+
+        window.qgisBackend.iniciarFerramentaVinculo(
+            dadosCadastroJson,
+            sessionStorage.getItem('token') || '',
+            API_URL
+        );
+    }
+
+    function sincronizarAreasLotesQGIS() {
+        if (sessionStorage.getItem('modoOffline') === 'true' || !navigator.onLine) {
+            alert('A sincronização das áreas exige conexão com a internet.');
+            return;
+        }
+
+        if (typeof window.qgisBackend === 'undefined' || !window.qgisBackend ||
+            typeof window.qgisBackend.sincronizarAreasLotes !== 'function') {
+            alert('Conexão com o QGIS não detectada. Esta função só funciona dentro do complemento QGIS.');
+            return;
+        }
+
+        const token = sessionStorage.getItem('token') || '';
+        if (!token) {
+            alert('Sessão não autenticada. Faça login novamente.');
+            return;
+        }
+
+        window.qgisBackend.sincronizarAreasLotes(token, API_URL);
+    }
+
+    // =============================================================
+    // VINCULAÇÃO DE EDIFICAÇÕES AO CADASTRO DO PROPRIETÁRIO NO QGIS
+    // =============================================================
+    let cadastroAtualEdificacoesQGIS = null;
+    let construcoesAtuaisQGIS = [];
+    let construcaoExistenteParaVincularQGIS = null;
+
+    function abrirModalVinculoEdificacao() {
+        const select = document.getElementById('select-proprietario-edificacao');
+        const filtro = document.getElementById('filtro-proprietario-edificacao');
+        if (filtro) filtro.value = '';
+        filtrarProprietariosEdificacao();
+        if (select.options.length === 1) return alert('Nenhum cadastro disponível. Sincronize os cadastros primeiro.');
+        document.getElementById('modal-vinculo-edificacao-qgis').style.display = 'flex';
+    }
+
+    function fecharModalVinculoEdificacao() {
+        document.getElementById('modal-vinculo-edificacao-qgis').style.display = 'none';
+    }
+
+    async function abrirGerenciadorEdificacoesQGIS() {
+        const cadastroId = document.getElementById('select-proprietario-edificacao').value;
+        if (!cadastroId) return alert('Selecione um proprietário.');
+        if (sessionStorage.getItem('modoOffline') === 'true' || !navigator.onLine) return alert('A vinculação de edificações exige conexão com a internet.');
+        const token = sessionStorage.getItem('token') || '';
+        if (!token) return alert('Sessão não autenticada. Faça login novamente.');
+
+        // A construção pertence ao cadastro/proprietário. Não é necessário que
+        // o cadastro já esteja vinculado a um lote nem que a área do lote tenha
+        // sido atualizada para abrir e utilizar este gerenciador.
+        cadastroAtualEdificacoesQGIS = (todosOsCadastros || []).find(c => String(c.id) === String(cadastroId)) || {id: Number(cadastroId)};
+        fecharModalVinculoEdificacao();
+        document.getElementById('modal-gerenciador-edificacoes-qgis').style.display = 'flex';
+        document.getElementById('titulo-gerenciador-edificacoes').textContent = 'Construções de ' + (cadastroAtualEdificacoesQGIS.req_nome || 'proprietário');
+
+        // Carrega primeiro as opções do mesmo cadastro/PGV usado no formulário
+        // normal. Isso evita que o select fique vazio quando o formulário
+        // principal ainda não tiver sido aberto nesta sessão.
+        await preencherListaPadroesConstrutivosQGIS();
+        await carregarConstrucoesDoProprietarioQGIS();
+        iniciarCapturaConstrucoesQGIS();
+    }
+
+    async function carregarConstrucoesDoProprietarioQGIS() {
+        if (!cadastroAtualEdificacoesQGIS) return;
+        const token = sessionStorage.getItem('token') || '';
+        const tbody = document.getElementById('lista-construcoes-qgis');
+        tbody.innerHTML = '<tr><td colspan="5" style="padding:12px;text-align:center;">Carregando construções...</td></tr>';
+        try {
+            const response = await fetch(`${API_URL}/api/qgis/construcoes/${cadastroAtualEdificacoesQGIS.id}`, {
+                headers: {'Authorization': 'Bearer ' + token}
+            });
+            const data = await response.json();
+            if (!response.ok || !data.sucesso) throw new Error(data.erro || 'Não foi possível carregar as construções.');
+            construcoesAtuaisQGIS = Array.isArray(data.construcoes) ? data.construcoes : [];
+            renderizarConstrucoesQGIS();
+        } catch (e) {
+            // O gerenciador continua utilizável mesmo quando não existem
+            // construções vinculadas ainda. A abertura não pode depender de
+            // lote/área do imóvel previamente sincronizados.
+            construcoesAtuaisQGIS = [];
+            tbody.innerHTML = `<tr><td colspan="5" style="padding:12px;text-align:center;color:#666;">Nenhuma construção cadastrada para este proprietário ainda.</td></tr>`;
+            console.warn('Não foi possível carregar as construções existentes:', e);
+        }
+    }
+
+    function renderizarConstrucoesQGIS() {
+        const tbody = document.getElementById('lista-construcoes-qgis');
+        if (!construcoesAtuaisQGIS.length) {
+            tbody.innerHTML = '<tr><td colspan="5" style="padding:12px;text-align:center;">Este proprietário ainda não possui construções cadastradas.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = construcoesAtuaisQGIS.map(c => `
+            <tr style="border-bottom:1px solid #eee;">
+                <td style="padding:9px;">${c.id}</td>
+                <td style="padding:9px;">${escapeHtmlQGIS(c.nome || '')}</td>
+                <td style="padding:9px;text-align:right;">${Number(c.area_construida || 0).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
+                <td style="padding:9px;">${escapeHtmlQGIS(c.padrao_construtivo || '—')}</td>
+                <td style="padding:7px;text-align:center;white-space:nowrap;">
+                    <button type="button" onclick="editarConstrucaoQGIS(${Number(c.id)})" title="Editar construção" style="background:#bda46b;color:white;border:0;padding:6px 9px;border-radius:4px;cursor:pointer;margin-right:4px;">✏️</button>
+                    <button type="button" onclick="excluirConstrucaoQGIS(${Number(c.id)})" title="Excluir construção" style="background:#dc3545;color:white;border:0;padding:6px 9px;border-radius:4px;cursor:pointer;margin-right:4px;">✖</button>
+                    <button type="button" onclick="vincularConstrucaoExistenteNoMapa(${Number(c.id)})" title="Vincular feição no mapa" style="background:#007bff;color:#fff;border:0;padding:6px 9px;border-radius:4px;cursor:pointer;">Vincular no mapa</button>
+                </td>
+            </tr>`).join('');
+    }
+
+    async function editarConstrucaoQGIS(construcaoId) {
+        const c = construcoesAtuaisQGIS.find(item => Number(item.id) === Number(construcaoId));
+        if (!c) return alert('Construção não encontrada na lista.');
+
+        // Garante que o valor salvo de padrão construtivo seja aplicado somente
+        // depois que as opções do select estiverem disponíveis.
+        await preencherListaPadroesConstrutivosQGIS();
+
+        document.getElementById('qgis-construcao-id').value = String(c.id);
+        document.getElementById('qgis-construcao-layer-id').value = '';
+        document.getElementById('qgis-construcao-feature-id').value = '';
+        const campos = {
+            'qgis-const-nome': 'nome',
+            'qgis-const-area': 'area_construida',
+            'qgis-const-padrao': 'padrao_construtivo',
+            'qgis-const-uso': 'uso_principal',
+            'qgis-const-tipo': 'tipo_imovel',
+            'qgis-const-estrutura': 'estrutura',
+            'qgis-const-cobertura': 'cobertura',
+            'qgis-const-sanitario': 'instalacao_sanitaria',
+            'qgis-const-forro': 'forro',
+            'qgis-const-piso': 'piso',
+            'qgis-const-portas': 'portas',
+            'qgis-const-janelas': 'janelas',
+            'qgis-const-revestimento': 'revestimento'
+        };
+        Object.entries(campos).forEach(([id, chave]) => {
+            const el = document.getElementById(id);
+            if (el) el.value = c[chave] == null ? '' : String(c[chave]);
+        });
+        document.getElementById('status-captura-edificacao').textContent = `Editando a construção #${c.id}. Altere os campos e clique em “Salvar alterações”. Não é necessário selecionar novamente a feição no mapa.`;
+        const submit = document.querySelector('#form-construcao-qgis button[type="submit"]');
+        if (submit) submit.textContent = 'Salvar alterações';
+        document.getElementById('qgis-const-nome').focus();
+    }
+
+    async function excluirConstrucaoQGIS(construcaoId) {
+        const c = construcoesAtuaisQGIS.find(item => Number(item.id) === Number(construcaoId));
+        if (!c) return alert('Construção não encontrada.');
+        if (!confirm(`Tem certeza que deseja excluir a construção "${c.nome || ('#' + c.id)}"? Esta ação não poderá ser desfeita.`)) return;
+
+        const token = sessionStorage.getItem('token') || '';
+        if (!token) return alert('Sessão não autenticada. Faça login novamente.');
+        if (!cadastroAtualEdificacoesQGIS || !cadastroAtualEdificacoesQGIS.id) {
+            return alert('Nenhum proprietário selecionado.');
+        }
+
+        const cadastroId = cadastroAtualEdificacoesQGIS.id;
+        const headers = getAuthHeaders();
+
+        try {
+            // O cadastro normal já usa a edição completa do cadastro para
+            // remover uma construção. Primeiro tentamos a rota específica do
+            // gerenciador QGIS, mantendo compatibilidade com instalações que
+            // já possuem DELETE implementado.
+            const deleteUrl = `${API_URL}/api/qgis/construcoes/${cadastroId}/${construcaoId}`;
+            const deleteResponse = await fetch(deleteUrl, {
+                method: 'DELETE',
+                headers: headers
+            });
+
+            const deleteText = await deleteResponse.text();
+            let deleteResult = null;
+            if (deleteText && deleteText.trim()) {
+                try { deleteResult = JSON.parse(deleteText); } catch (_) { deleteResult = null; }
+            }
+
+            if (deleteResponse.ok && (!deleteResult || deleteResult.sucesso !== false)) {
+                if (String(document.getElementById('qgis-construcao-id').value) === String(construcaoId)) {
+                    limparFormularioCapturaEdificacao();
+                }
+                await carregarConstrucoesDoProprietarioQGIS();
+                return;
+            }
+
+            // Se a rota DELETE não existir no backend, usamos exatamente a
+            // mesma lógica de persistência do cadastro normal: carregar o
+            // cadastro, retirar somente esta construção e salvar novamente.
+            if (deleteResponse.status !== 404 && deleteResponse.status !== 405) {
+                const detalhe = deleteResult?.erro || deleteResult?.mensagem ||
+                    (deleteText && !deleteText.trim().startsWith('<') ? deleteText.trim() : '') ||
+                    `Backend HTTP ${deleteResponse.status}`;
+                throw new Error(detalhe);
+            }
+
+            const cadastroResponse = await fetch(`${API_URL}/api/cadastros/${cadastroId}`, {
+                headers: headers
+            });
+            const cadastroText = await cadastroResponse.text();
+            let cadastroData = null;
+            if (cadastroText && cadastroText.trim()) {
+                try { cadastroData = JSON.parse(cadastroText); } catch (_) { cadastroData = null; }
+            }
+            if (!cadastroResponse.ok || !cadastroData) {
+                throw new Error(cadastroData?.erro || cadastroData?.mensagem || `Não foi possível carregar o cadastro (HTTP ${cadastroResponse.status}).`);
+            }
+
+            const cadastro = cadastroData.cadastro || cadastroData.dados || cadastroData;
+            const construcoes = Array.isArray(cadastro.construcoes) ? cadastro.construcoes : [];
+            const restantes = construcoes.filter(item => String(item.id) !== String(construcaoId));
+
+            if (restantes.length === construcoes.length) {
+                throw new Error('A construção selecionada não foi encontrada no cadastro do proprietário.');
+            }
+
+            // Envia o cadastro completo, como o botão Salvar do cadastro
+            // normal faz. Campos internos do servidor não são reenviados.
+            const payload = { ...cadastro, construcoes: restantes };
+            delete payload.id;
+            delete payload.edit_id;
+            delete payload._isOffline;
+
+            const salvarResponse = await fetch(`${API_URL}/api/cadastros/${cadastroId}`, {
+                method: 'PUT',
+                headers: headers,
+                body: JSON.stringify(payload)
+            });
+            const salvarText = await salvarResponse.text();
+            let salvarResult = null;
+            if (salvarText && salvarText.trim()) {
+                try { salvarResult = JSON.parse(salvarText); } catch (_) { salvarResult = null; }
+            }
+
+            if (!salvarResponse.ok || (salvarResult && salvarResult.sucesso === false)) {
+                const detalhe = salvarResult?.erro || salvarResult?.mensagem ||
+                    (salvarText && !salvarText.trim().startsWith('<') ? salvarText.trim() : '') ||
+                    `Backend HTTP ${salvarResponse.status}`;
+                throw new Error(detalhe);
+            }
+
+            if (String(document.getElementById('qgis-construcao-id').value) === String(construcaoId)) {
+                limparFormularioCapturaEdificacao();
+            }
+            await carregarConstrucoesDoProprietarioQGIS();
+        } catch (e) {
+            console.error('Erro ao excluir construção:', e);
+            alert('Erro ao excluir construção: ' + e.message);
+        }
+    }
+
+    function escapeHtmlQGIS(value) {
+        return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+
+    async function preencherListaPadroesConstrutivosQGIS() {
+        // Reaproveita exatamente as opções do formulário normal.
+        // Se o formulário principal ainda não foi inicializado nesta sessão,
+        // busca a mesma fonte da PGV diretamente para não deixar o select vazio.
+        const campos = {
+            'qgis-const-padrao': 'const_padrao',
+            'qgis-const-estrutura': 'const_estrutura',
+            'qgis-const-cobertura': 'const_cobertura',
+            'qgis-const-sanitario': 'const_instalacao_sanitaria',
+            'qgis-const-forro': 'const_forro',
+            'qgis-const-piso': 'const_piso',
+            'qgis-const-portas': 'const_portas',
+            'qgis-const-janelas': 'const_janelas',
+            'qgis-const-revestimento': 'const_revestimento'
+        };
+
+        const origemPadrao = document.getElementById('const_padrao');
+        if (origemPadrao && origemPadrao.options.length <= 1 &&
+            sessionStorage.getItem('modoOffline') !== 'true' && navigator.onLine) {
+            try {
+                const resposta = await fetch(`${API_URL}/api/planta_generica/padroes`, { headers: getAuthHeaders() });
+                if (resposta.ok) {
+                    const padroes = await resposta.json();
+                    todosPadroes = Array.isArray(padroes) ? padroes : [];
+                    origemPadrao.innerHTML = '<option value="" disabled selected>Selecione...</option>' +
+                        todosPadroes.map(item => `<option value="${escapeHtmlQGIS(item.descricao)}" data-valor="${item.valor_m2}">${escapeHtmlQGIS(item.descricao)}</option>`).join('');
+                }
+            } catch (e) {
+                console.warn('Não foi possível carregar os padrões construtivos para o gerenciador QGIS:', e);
+            }
+        }
+
+        Object.entries(campos).forEach(([destinoId, origemId]) => {
+            const destino = document.getElementById(destinoId);
+            const origem = document.getElementById(origemId);
+            if (!destino || !origem) return;
+            destino.innerHTML = origem.innerHTML || '<option value="">Selecione...</option>';
+            destino.value = '';
+        });
+
+        // Caso o select principal ainda esteja sem opções, usa todosPadroes como
+        // fallback para o Padrão Construtivo, sem alterar os demais campos.
+        const destinoPadrao = document.getElementById('qgis-const-padrao');
+        if (destinoPadrao && destinoPadrao.options.length <= 1 && Array.isArray(todosPadroes) && todosPadroes.length) {
+            destinoPadrao.innerHTML = '<option value="" disabled selected>Selecione...</option>' +
+                todosPadroes.map(item => `<option value="${escapeHtmlQGIS(item.descricao)}" data-valor="${item.valor_m2}">${escapeHtmlQGIS(item.descricao)}</option>`).join('');
+        }
+    }
+
+    function vincularConstrucaoExistenteNoMapa(construcaoId) {
+        if (!cadastroAtualEdificacoesQGIS) return;
+        construcaoExistenteParaVincularQGIS = Number(construcaoId);
+        document.getElementById('orientacao-captura-edificacao').textContent = `Vinculando a construção #${construcaoId}: clique agora no polígono correspondente no mapa. A área será recalculada e atualizada.`;
+        const token = sessionStorage.getItem('token') || '';
+        if (!window.qgisBackend || typeof window.qgisBackend.iniciarCapturaConstrucoes !== 'function') {
+            construcaoExistenteParaVincularQGIS = null;
+            return alert('Conexão com o QGIS não detectada.');
+        }
+        window.qgisBackend.iniciarCapturaConstrucoes(token, API_URL);
+    }
+
+    function iniciarCapturaConstrucoesQGIS() {
+        if (!cadastroAtualEdificacoesQGIS) return;
+        construcaoExistenteParaVincularQGIS = null;
+        const token = sessionStorage.getItem('token') || '';
+        if (!window.qgisBackend || typeof window.qgisBackend.iniciarCapturaConstrucoes !== 'function') {
+            alert('Conexão com o QGIS não detectada. Abra esta função dentro do complemento QGIS.');
+            return;
+        }
+        document.getElementById('orientacao-captura-edificacao').textContent = 'Ferramenta ativa: clique no polígono de uma construção no mapa. A área será preenchida automaticamente. Salve os dados e repita para outras edificações.';
+        window.qgisBackend.iniciarCapturaConstrucoes(token, API_URL);
+    }
+
+    let geometriaCapturadaConstrucaoQGIS = null;
+
+    async function preencherCapturaConstrucaoQGIS(dados) {
+        if (!document.getElementById('modal-gerenciador-edificacoes-qgis') ||
+            document.getElementById('modal-gerenciador-edificacoes-qgis').style.display !== 'flex') return;
+
+        geometriaCapturadaConstrucaoQGIS = dados.geometria || null;
+
+        // Se o usuário escolheu uma construção já cadastrada na tabela, vincula a feição a ela.
+        if (construcaoExistenteParaVincularQGIS) {
+            const construcaoId = construcaoExistenteParaVincularQGIS;
+            construcaoExistenteParaVincularQGIS = null;
+            try {
+                const token = sessionStorage.getItem('token') || '';
+                const response = await fetch(`${API_URL}/api/qgis/atualizar-area-construcao/${construcaoId}`, {
+                    method: 'PUT',
+                    headers: {'Content-Type':'application/json','Authorization':'Bearer ' + token},
+                    body: JSON.stringify({area_construida: Number(Number(dados.area_m2 || 0).toFixed(2)), geometria: dados.geometria || null})
+                });
+                const result = await response.json();
+                if (!response.ok || !result.sucesso) throw new Error(result.erro || 'Não foi possível atualizar a área.');
+                if (!window.qgisBackend || typeof window.qgisBackend.vincularConstrucaoNaFeicao !== 'function') throw new Error('Ponte com o QGIS indisponível.');
+                window.qgisBackend.vincularConstrucaoNaFeicao(String(dados.layer_id), String(dados.feature_id), String(construcaoId), String(cadastroAtualEdificacoesQGIS.id));
+                document.getElementById('status-captura-edificacao').textContent = `Construção #${construcaoId} vinculada à feição ${dados.feature_id}. Área atualizada para ${Number(dados.area_m2 || 0).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2})} m².`;
+                await carregarConstrucoesDoProprietarioQGIS();
+            } catch (e) {
+                alert('Falha ao vincular construção existente: ' + e.message);
+            }
+            return;
+        }
+
+        document.getElementById('qgis-construcao-layer-id').value = dados.layer_id || '';
+        document.getElementById('qgis-construcao-feature-id').value = dados.feature_id ?? '';
+        document.getElementById('qgis-const-area').value = Number(dados.area_m2 || 0).toFixed(2);
+        document.getElementById('status-captura-edificacao').textContent = `Feição capturada: ${dados.layer_name} / ID ${dados.feature_id} — área cartesiana: ${Number(dados.area_m2 || 0).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2})} m². Preencha os dados e salve.`;
+        document.getElementById('qgis-const-nome').focus();
+    }
+
+    function limparFormularioCapturaEdificacao() {
+        document.getElementById('form-construcao-qgis').reset();
+        document.getElementById('qgis-construcao-layer-id').value = '';
+        document.getElementById('qgis-construcao-feature-id').value = '';
+        document.getElementById('qgis-construcao-id').value = '';
+        geometriaCapturadaConstrucaoQGIS = null;
+        const submit = document.querySelector('#form-construcao-qgis button[type="submit"]');
+        if (submit) submit.textContent = 'Salvar construção e vincular feição';
+        document.getElementById('status-captura-edificacao').textContent = 'Clique no polígono da construção no mapa. A área será preenchida automaticamente.';
+    }
+
+    async function salvarConstrucaoCapturadaQGIS(event) {
+        event.preventDefault();
+        if (!cadastroAtualEdificacoesQGIS) return alert('Nenhum proprietário selecionado.');
+        const layerId = document.getElementById('qgis-construcao-layer-id').value;
+        const featureId = document.getElementById('qgis-construcao-feature-id').value;
+        const construcaoIdEdicao = document.getElementById('qgis-construcao-id').value;
+        if (!construcaoIdEdicao && (!layerId || featureId === '')) return alert('Primeiro selecione o polígono da construção no mapa para preencher a geometria e a área.');
+        const token = sessionStorage.getItem('token') || '';
+        const dados = {
+            nome: document.getElementById('qgis-const-nome').value.trim(),
+            area_construida: Number(Number(document.getElementById('qgis-const-area').value || 0).toFixed(2)),
+            padrao_construtivo: document.getElementById('qgis-const-padrao').value.trim(),
+            uso_principal: document.getElementById('qgis-const-uso').value,
+            tipo_imovel: document.getElementById('qgis-const-tipo').value,
+            estrutura: document.getElementById('qgis-const-estrutura').value,
+            cobertura: document.getElementById('qgis-const-cobertura').value,
+            instalacao_sanitaria: document.getElementById('qgis-const-sanitario').value,
+            forro: document.getElementById('qgis-const-forro').value,
+            piso: document.getElementById('qgis-const-piso').value,
+            portas: document.getElementById('qgis-const-portas').value,
+            janelas: document.getElementById('qgis-const-janelas').value,
+            revestimento: document.getElementById('qgis-const-revestimento').value,
+            geometria: geometriaCapturadaConstrucaoQGIS
+        };
+        try {
+            let response, result;
+            if (construcaoIdEdicao) {
+                response = await fetch(`${API_URL}/api/qgis/construcoes/${cadastroAtualEdificacoesQGIS.id}/${construcaoIdEdicao}`, {
+                    method: 'PUT',
+                    headers: {'Content-Type':'application/json','Authorization':'Bearer ' + token},
+                    body: JSON.stringify(dados)
+                });
+                result = await response.json();
+                if (!response.ok || !result.sucesso) throw new Error(result.erro || 'Falha ao atualizar a construção.');
+                alert('Construção atualizada com sucesso.');
+            } else {
+                response = await fetch(`${API_URL}/api/qgis/construcoes/${cadastroAtualEdificacoesQGIS.id}`, {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/json','Authorization':'Bearer ' + token},
+                    body: JSON.stringify(dados)
+                });
+                result = await response.json();
+                if (!response.ok || !result.sucesso) throw new Error(result.erro || 'Falha ao salvar a construção.');
+                const construcao = result.construcao;
+                if (!window.qgisBackend || typeof window.qgisBackend.vincularConstrucaoNaFeicao !== 'function') {
+                    alert('A construção foi salva no banco, mas a ponte com o QGIS não está disponível para gravar o vínculo espacial.');
+                } else {
+                    window.qgisBackend.vincularConstrucaoNaFeicao(String(layerId), String(featureId), String(construcao.id), String(cadastroAtualEdificacoesQGIS.id));
+                }
+                alert(`Construção "${construcao.nome}" cadastrada com ${Number(construcao.area_construida).toLocaleString('pt-BR')} m².`);
+            }
+            await carregarConstrucoesDoProprietarioQGIS();
+            limparFormularioCapturaEdificacao();
+            if (!construcaoIdEdicao) {
+                iniciarCapturaConstrucoesQGIS();
+            }
+        } catch (e) {
+            alert('Não foi possível salvar a construção: ' + e.message);
+        }
+    }
+
+    async function sincronizarAreasConstrucoesQGIS() {
+        if (sessionStorage.getItem('modoOffline') === 'true' || !navigator.onLine) return alert('A sincronização das áreas exige conexão com a internet.');
+        const token = sessionStorage.getItem('token') || '';
+        if (!token) return alert('Sessão não autenticada. Faça login novamente.');
+        if (!window.qgisBackend || typeof window.qgisBackend.sincronizarAreasConstrucoes !== 'function') return alert('Conexão com o QGIS não detectada.');
+        window.qgisBackend.sincronizarAreasConstrucoes(token, API_URL);
+    }
+
+    function fecharGerenciadorEdificacoesQGIS() {
+        document.getElementById('modal-gerenciador-edificacoes-qgis').style.display = 'none';
+        construcaoExistenteParaVincularQGIS = null;
+        if (window.qgisBackend && typeof window.qgisBackend.pararCapturaConstrucoes === 'function') window.qgisBackend.pararCapturaConstrucoes();
+        cadastroAtualEdificacoesQGIS = null;
+        limparFormularioCapturaEdificacao();
+    }
 
 </script>
 </body>
