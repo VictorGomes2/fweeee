@@ -801,35 +801,40 @@ def atualizar_area_construcao_qgis(current_user, construcao_id):
 @app.route('/api/cadastros', methods=['GET'])
 @token_required
 def get_cadastros(current_user):
-    cadastros = CadastroReurb.query.options(joinedload(CadastroReurb.construcoes)).order_by(CadastroReurb.id.desc()).all()
-    output = []
-    
-    for c in cadastros:
-        cadastro_data = {col.name: getattr(c, col.name) for col in c.__table__.columns if col.name not in ['imovel_estrutura', 'imovel_cobertura', 'imovel_instalacao_sanitaria', 'imovel_forro', 'imovel_piso', 'imovel_portas', 'imovel_janelas', 'imovel_revestimento']}
+    try:
+        cadastros = CadastroReurb.query.options(joinedload(CadastroReurb.construcoes)).order_by(CadastroReurb.id.desc()).all()
+        output = []
 
-        valores = CalculoTributarioService.calcular_valores(c)
-        renda, outro_imovel = c.reurb_renda_familiar or 0, c.reurb_outro_imovel or ''
-        tipo_reurb = 'REURB-S' if renda <= 7500 and outro_imovel.lower() == 'nao' else 'REURB-E'
+        for c in cadastros:
+            cadastro_data = {col.name: getattr(c, col.name) for col in c.__table__.columns if col.name not in ['imovel_estrutura', 'imovel_cobertura', 'imovel_instalacao_sanitaria', 'imovel_forro', 'imovel_piso', 'imovel_portas', 'imovel_janelas', 'imovel_revestimento']}
 
-        cadastro_data['tipo_reurb'] = tipo_reurb
-        cadastro_data.update(valores)
+            valores = CalculoTributarioService.calcular_valores(c)
+            renda, outro_imovel = c.reurb_renda_familiar or 0, c.reurb_outro_imovel or ''
+            tipo_reurb = 'REURB-S' if renda <= 7500 and outro_imovel.lower() == 'nao' else 'REURB-E'
 
-        total_area_construida = 0
-        construcoes_list = []
-        for construcao in c.construcoes:
-            total_area_construida += construcao.area_construida or 0
-            construcoes_list.append({col.name: getattr(construcao, col.name) for col in construcao.__table__.columns})
-        
-        cadastro_data['construcoes'] = construcoes_list
-        cadastro_data['imovel_area_construida'] = total_area_construida
+            cadastro_data['tipo_reurb'] = tipo_reurb
+            cadastro_data.update(valores)
 
-        for key, value in cadastro_data.items():
-            if isinstance(value, (datetime.datetime, datetime.date)):
-                cadastro_data[key] = value.isoformat()
+            total_area_construida = 0
+            construcoes_list = []
+            for construcao in c.construcoes:
+                total_area_construida += construcao.area_construida or 0
+                construcoes_list.append({col.name: getattr(construcao, col.name) for col in construcao.__table__.columns})
 
-        output.append(cadastro_data)
-        
-    return jsonify({'cadastros': output})
+            cadastro_data['construcoes'] = construcoes_list
+            cadastro_data['imovel_area_construida'] = total_area_construida
+
+            for key, value in cadastro_data.items():
+                if isinstance(value, (datetime.datetime, datetime.date)):
+                    cadastro_data[key] = value.isoformat()
+
+            output.append(cadastro_data)
+
+        return jsonify({'cadastros': output}), 200
+    except Exception as erro:
+        db.session.rollback()
+        app.logger.exception('Erro ao carregar a lista completa de cadastros.')
+        return jsonify({'erro': 'Não foi possível carregar os cadastros no momento. Os dados do banco foram preservados.'}), 500
 
 @app.route('/api/cadastros/por_inscricao/<inscricao_imobiliaria>', methods=['GET'])
 @token_required
